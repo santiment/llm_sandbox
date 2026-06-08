@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtualenv / uv
+.venv/
+
+# Env — ignore every .env variant, keep the committed template
+.env
+.env.*
+!.env.example
+
+# Backups
+*.bak
+
+# OS
+.DS_Store
