@@ -33,11 +33,18 @@ def _env(name: str, default: str = "") -> str:
 
 @dataclass
 class Config:
-    provider: str            # "gvisor"
+    provider: str            # "gvisor" (docker, local) | "k8s" (pod-per-session on Kubernetes)
     auth_token: str          # shared bearer; callers send `Authorization: Bearer <token>`. Empty = auth off (dev only).
     default_image: str       # sandbox runtime image (built from sandbox.Dockerfile)
     docker_runtime: str      # "runsc" (gVisor, prod) | "runc" (standard, dev only — NOT isolated)
     max_output_bytes: int    # hard cap on any single stdout/stderr/file payload
+
+    # --- k8s provider only (SANDBOX_PROVIDER=k8s) ---
+    k8s_namespace: str       # namespace for session pods; "" = the service's own namespace
+    k8s_runtime_class: str   # RuntimeClass for session pods; "" = cluster default (NOT isolated)
+    k8s_node_selector: str   # "k=v[,k=v…]" pinning session pods to the sandbox node group
+    k8s_toleration: str      # "key=value:Effect" matching the sandbox node taint; "" = none
+    k8s_create_timeout: int  # seconds to wait for a session pod to become Ready
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -47,4 +54,12 @@ class Config:
             default_image=_env("SANDBOX_IMAGE", "llm-sandbox-runtime:latest"),
             docker_runtime=_env("SANDBOX_DOCKER_RUNTIME", "runsc"),
             max_output_bytes=int(_env("SANDBOX_MAX_OUTPUT_BYTES", "1000000") or 1_000_000),
+            # Defaults mirror the stage cluster's gVisor setup (devops doc): RuntimeClass
+            # `gvisor`, instance group `ai-sandbox`, taint `dedicated=ai-sandbox:NoSchedule`.
+            k8s_namespace=_env("SANDBOX_K8S_NAMESPACE"),
+            k8s_runtime_class=_env("SANDBOX_K8S_RUNTIME_CLASS", "gvisor"),
+            k8s_node_selector=_env("SANDBOX_K8S_NODE_SELECTOR",
+                                   "kops.k8s.io/instancegroup=ai-sandbox"),
+            k8s_toleration=_env("SANDBOX_K8S_TOLERATION", "dedicated=ai-sandbox:NoSchedule"),
+            k8s_create_timeout=int(_env("SANDBOX_K8S_CREATE_TIMEOUT", "120") or 120),
         )

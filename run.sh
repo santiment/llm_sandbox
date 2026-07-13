@@ -36,7 +36,7 @@ case "${1:-up}" in
     docker info >/dev/null 2>&1 || die "Docker daemon not running — start Docker Desktop"
     command -v uv >/dev/null || die "uv not found (https://docs.astral.sh/uv/)"
     if [ "${1:-up}" = "--rebuild" ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-      echo "▶ building $IMAGE (python3 + node + shell tools)…"
+      echo "▶ building $IMAGE (python3 + pandas/numpy + shell tools)…"
       docker build -f sandbox.Dockerfile -t "$IMAGE" .
     else
       echo "▶ image $IMAGE present (./run.sh --rebuild to rebuild)"

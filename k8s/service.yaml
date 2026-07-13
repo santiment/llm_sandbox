@@ -1,0 +1,13 @@
+# In-cluster endpoint callers (backend, agent) use: http://llm-sandbox.llm-sandbox
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-sandbox
+  namespace: llm-sandbox
+spec:
+  selector:
+    app: llm-sandbox
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8900

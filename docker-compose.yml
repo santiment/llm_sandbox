@@ -1,0 +1,41 @@
+# Local dev bring-up: `docker compose up --build`, then point your agent at
+# http://localhost:8900 with `Authorization: Bearer $LLM_SANDBOX_TOKEN`.
+#
+# The service uses the HOST docker daemon (mounted socket) and spawns one SIBLING container
+# per session from llm-sandbox-runtime:latest — same plumbing as prod, but under runc:
+# NO isolation on a dev box. Never expose this setup to untrusted code.
+services:
+  llm-sandbox:
+    build:
+      context: .
+      target: dev
+    ports:
+      - "8900:8900"
+    environment:
+      SANDBOX_PROVIDER: gvisor
+      # macOS/dev: no gVisor in Docker Desktop → runc (plumbing only, NOT a security
+      # boundary). On a Linux box with runsc installed, set runsc for the real thing.
+      SANDBOX_DOCKER_RUNTIME: ${SANDBOX_DOCKER_RUNTIME:-runc}
+      SANDBOX_IMAGE: llm-sandbox-runtime:latest
+      LLM_SANDBOX_TOKEN: ${LLM_SANDBOX_TOKEN:-change-me}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      runtime-image:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:8900/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Build-only helper: guarantees the sandbox runtime image exists on the host daemon
+  # (tagged llm-sandbox-runtime:latest) before the service starts. Exits immediately.
+  runtime-image:
+    build:
+      context: .
+      dockerfile: sandbox.Dockerfile
+    image: llm-sandbox-runtime:latest
+    command: ["true"]
+    restart: "no"

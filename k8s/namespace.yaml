@@ -1,0 +1,6 @@
+# Everything (service + session pods) lives in one namespace so the Role below can be
+# namespace-scoped — the service never needs cluster-wide rights.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-sandbox

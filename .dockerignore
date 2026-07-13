@@ -1,0 +1,19 @@
+# Never bake secrets or local state into images.
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+.claude
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.egg-info
+**/*.egg-info
+.DS_Store
+k8s/
+docker-compose.yml
+README.md
+LICENSE
+run.sh

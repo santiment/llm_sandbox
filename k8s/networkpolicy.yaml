@@ -1,0 +1,49 @@
+# Egress control for session pods — the k8s equivalent of the docker provider's
+# `--network none` default. Requires a CNI that enforces NetworkPolicy (calico/cilium/…);
+# verify on the cluster, otherwise these are silently inert.
+#
+# Note: `kubectl exec` (how the service drives sessions) goes apiserver→kubelet→runtime,
+# NOT through the pod network — deny-all does not break it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llm-sandbox-session-default-deny
+  namespace: llm-sandbox
+spec:
+  # Every session pod: no ingress, no egress.
+  podSelector:
+    matchLabels:
+      app: llm-sandbox-session
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llm-sandbox-session-allow-egress
+  namespace: llm-sandbox
+spec:
+  # Sessions created with network=true get this label from the provider: public internet
+  # + DNS only — cluster/VPC ranges and the cloud metadata service stay blocked.
+  podSelector:
+    matchLabels:
+      llm-sandbox/network: "true"
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16

@@ -31,7 +31,7 @@ class ExecRequest(BaseModel):
 
 
 class RunRequest(BaseModel):
-    language: Literal["python", "javascript"]
+    language: Literal["python"]          # python-only sandbox (runtime image ships no node)
     code: str
     timeout_seconds: int = 60
 

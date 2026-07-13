@@ -1,0 +1,33 @@
+# Minimal rights for the service: manage session pods + exec into them. Namespace-scoped.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llm-sandbox
+  namespace: llm-sandbox
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: llm-sandbox
+  namespace: llm-sandbox
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: llm-sandbox
+  namespace: llm-sandbox
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: llm-sandbox
+subjects:
+  - kind: ServiceAccount
+    name: llm-sandbox
+    namespace: llm-sandbox

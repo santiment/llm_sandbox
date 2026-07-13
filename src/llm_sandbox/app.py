@@ -46,7 +46,7 @@ provider = build_provider(cfg)
 app = FastAPI(title="llm-sandbox", version="0.1.0")
 
 # language → (file extension, interpreter binary in the sandbox image)
-_RUNNERS = {"python": ("py", "python3"), "javascript": ("js", "node")}
+_RUNNERS = {"python": ("py", "python3")}
 
 
 def _preview(s: str, n: int = 800) -> str:

@@ -1,0 +1,80 @@
+# The service (trusted control plane). Runs on NORMAL nodes — no gVisor, no ai-sandbox
+# toleration. Only the session pods it spawns land on the gVisor node group.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-sandbox
+  namespace: llm-sandbox
+  labels:
+    app: llm-sandbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-sandbox
+  template:
+    metadata:
+      labels:
+        app: llm-sandbox
+    spec:
+      serviceAccountName: llm-sandbox
+      containers:
+        - name: llm-sandbox
+          # CHANGEME: your registry — built from ./Dockerfile
+          image: your-registry.example.com/llm-sandbox:latest
+          ports:
+            - containerPort: 8900
+          env:
+            - name: SANDBOX_PROVIDER
+              value: "k8s"
+            # CHANGEME: your registry — built from ./sandbox.Dockerfile; the image session
+            # pods run. Must be pullable by the ai-sandbox node.
+            - name: SANDBOX_IMAGE
+              value: "your-registry.example.com/llm-sandbox-runtime:latest"
+            # Session pods go to the service's own namespace.
+            - name: SANDBOX_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # gVisor placement (RuntimeClass / nodeSelector / toleration) comes from the
+            # code defaults, which match the stage cluster. On a different cluster set
+            # SANDBOX_K8S_RUNTIME_CLASS / SANDBOX_K8S_NODE_SELECTOR / SANDBOX_K8S_TOLERATION.
+            - name: LLM_SANDBOX_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-sandbox
+                  key: token
+            # kubectl writes its discovery cache under $HOME — point it at the tmpfs.
+            - name: HOME
+              value: "/tmp"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8900
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8900
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
