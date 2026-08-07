@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      # The lock must match pyproject (incl. the exclude-newer freshness window) —
+      # a drifted lock fails here instead of resolving differently per machine.
+      - run: uv lock --check
+      # dev is a dependency-group (installed by `uv sync` by default), not an extra.
+      - run: uv sync
+      - run: uv run pytest -q
