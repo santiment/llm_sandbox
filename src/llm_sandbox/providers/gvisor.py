@@ -10,30 +10,66 @@ NOT a security boundary, only for testing the plumbing.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import uuid
 
-from .base import WORKDIR, CliSessionMixin, run_cli
+from .base import WORKDIR, SessionOpsMixin, run_cli
 
 log = logging.getLogger("llm_sandbox.gvisor")
 
 _NAME_PREFIX = "llmsbx_"
 
 
-class GvisorProvider(CliSessionMixin):
+class GvisorProvider(SessionOpsMixin):
     name = "gvisor"
 
-    def __init__(self, *, default_image: str, docker_runtime: str, max_output_bytes: int) -> None:
+    def __init__(self, *, default_image: str, docker_runtime: str, max_output_bytes: int,
+                 max_concurrency: int = 16) -> None:
         self.default_image = default_image
         self.docker_runtime = docker_runtime
         self.max_output_bytes = max_output_bytes
+        # This provider really does fork a `docker` binary per call, so the cap here is a
+        # memory guard, not just a politeness limit.
+        self._sem = asyncio.Semaphore(max_concurrency)
+
+    async def startup(self) -> None:
+        return None
+
+    async def shutdown(self) -> None:
+        return None
+
+    async def preflight(self) -> None:
+        rc, _out, err = await self._docker("version", "--format", "{{.Server.Version}}",
+                                           timeout=10)
+        if rc != 0:
+            raise RuntimeError(
+                f"docker daemon unreachable: {err.decode(errors='replace').strip()}")
+        # A runtime the daemon does not have only fails on the first `create`. Surface it at
+        # readiness instead, so a misconfigured box reports "no gVisor here" up front rather
+        # than handing the first caller a 500 — and so nobody assumes they are isolated.
+        rc, out, _err = await self._docker("info", "--format", "{{json .Runtimes}}", timeout=10)
+        if rc != 0:
+            return  # can't tell (old daemon): leave it to create's error path
+        try:
+            runtimes = json.loads(out.decode() or "{}")
+        except ValueError:
+            return
+        if runtimes and self.docker_runtime not in runtimes:
+            raise RuntimeError(
+                f"docker runtime {self.docker_runtime!r} is not registered with the daemon "
+                f"(available: {', '.join(sorted(runtimes)) or 'none'}) — install gVisor and "
+                "register runsc, or set SANDBOX_DOCKER_RUNTIME=runc to accept a box with NO "
+                "isolation (dev only)")
 
     def _container(self, session_id: str) -> str:
         return f"{_NAME_PREFIX}{session_id}"
 
     async def _docker(self, *args: str, stdin: bytes | None = None,
                       timeout: float | None = None) -> tuple[int, bytes, bytes]:
-        return await run_cli("docker", *args, stdin=stdin, timeout=timeout)
+        async with self._sem:
+            return await run_cli("docker", *args, stdin=stdin, timeout=timeout)
 
     async def _exec_cli(self, session_id, *cmd, stdin=None, timeout=None):
         interactive = ("-i",) if stdin is not None else ()

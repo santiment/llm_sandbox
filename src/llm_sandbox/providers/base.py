@@ -5,9 +5,10 @@ layer (``app.py``) composes ``run`` (python) on top of ``write_file`` + ``exec``
 provider only needs these six primitives. A *session* is a persistent workspace: files
 written via ``write_file`` survive across ``exec`` calls until ``destroy``.
 
-``CliSessionMixin`` implements the four in-session primitives once for providers that
-drive sessions through a CLI (``docker exec`` / ``kubectl exec``); such a provider only
-supplies ``create``/``destroy`` and the one-line ``_exec_cli`` hook.
+``SessionOpsMixin`` implements the four in-session primitives once, on top of a single
+"run this argv inside the session" hook. Both providers supply that hook — the docker one
+by forking ``docker exec``, the Kubernetes one by opening an apiserver exec stream — so
+file and command semantics stay identical across backends by construction.
 """
 
 from __future__ import annotations
@@ -23,6 +24,16 @@ from ..models import ExecResult, FileEntry
 
 WORKDIR = "/workspace"
 TIMEOUT_EXIT = 124  # conventional "timed out" exit code
+
+
+def clamp_resources(memory_mb: int, cpus: float, *, max_memory_mb: int,
+                    max_cpus: float) -> tuple[int, float]:
+    """Bound caller-supplied session limits. Without this a caller can ask for 64 CPUs and
+    30 Gi per session and pin the whole sandbox node group — the request fields are part of
+    the public API, so they are attacker-controlled input, not configuration."""
+    memory_mb = max(64, min(int(memory_mb), max_memory_mb))
+    cpus = max(0.1, min(float(cpus), max_cpus))
+    return memory_mb, cpus
 
 
 def cap_output(data: bytes | str, limit: int) -> tuple[str, bool]:
@@ -65,14 +76,14 @@ _LIST_FILES_SNIPPET = (
 )
 
 
-class CliSessionMixin:
+class SessionOpsMixin:
     """``exec``/``write_file``/``read_file``/``list_files`` implemented once against a
     single provider hook::
 
         _exec_cli(session_id, *cmd, stdin=None, timeout=None) -> (exit_code, stdout, stderr)
 
-    which runs ``cmd`` inside the session's container/pod (passing ``-i`` iff ``stdin``
-    is not None). Requires ``self.max_output_bytes``."""
+    which runs ``cmd`` inside the session's container/pod, feeding it ``stdin`` when that is
+    not None. Requires ``self.max_output_bytes``."""
 
     max_output_bytes: int
 
@@ -128,6 +139,21 @@ class CliSessionMixin:
 @runtime_checkable
 class SandboxProvider(Protocol):
     name: str
+
+    async def startup(self) -> None:
+        """Called once from the app lifespan, inside the event loop. Open pools, start
+        background tasks."""
+        ...
+
+    async def shutdown(self) -> None:
+        """Called once on app shutdown."""
+        ...
+
+    async def preflight(self) -> None:
+        """Raise if the backend is not usable (unreachable, missing rights). Backs
+        ``/readyz`` so misconfiguration shows up as an unready pod instead of as the first
+        caller's 500."""
+        ...
 
     async def create(self, *, image: Optional[str], timeout_seconds: int, network: bool,
                      memory_mb: int, cpus: float) -> str:

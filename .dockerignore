@@ -13,6 +13,9 @@ __pycache__
 **/*.egg-info
 .DS_Store
 k8s/
+.pytest_cache
+# tests/ stays IN the context: the Dockerfile `test` target copies it. The runtime stages
+# never COPY it, so shipped images are unaffected.
 docker-compose.yml
 README.md
 LICENSE

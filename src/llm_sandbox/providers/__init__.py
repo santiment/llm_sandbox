@@ -14,6 +14,7 @@ def build_provider(cfg: Config) -> SandboxProvider:
             default_image=cfg.default_image,
             docker_runtime=cfg.docker_runtime,
             max_output_bytes=cfg.max_output_bytes,
+            max_concurrency=cfg.max_concurrency,
         )
     if cfg.provider == "k8s":
         from .k8s import K8sProvider
@@ -25,5 +26,9 @@ def build_provider(cfg: Config) -> SandboxProvider:
             toleration=cfg.k8s_toleration,
             create_timeout=cfg.k8s_create_timeout,
             max_output_bytes=cfg.max_output_bytes,
+            image_pull_secrets=cfg.k8s_image_pull_secrets,
+            max_concurrency=cfg.max_concurrency,
+            reap_interval=cfg.k8s_reap_interval,
+            allow_no_runtime_class=cfg.k8s_allow_no_runtime_class,
         )
     raise ValueError(f"unknown SANDBOX_PROVIDER={cfg.provider!r} (expected 'gvisor' or 'k8s')")

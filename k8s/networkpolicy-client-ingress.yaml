@@ -1,0 +1,29 @@
+# OPTIONAL — apply only after labelling your caller namespaces, or you will cut the service
+# off from every client.
+#
+# Without this, any pod in the cluster can reach the service on :8900 and the bearer token is
+# the only thing in the way. With it, reachability is restricted to namespaces that opt in:
+#
+#   kubectl label namespace <backend-ns> llm-sandbox/client=true
+#   kubectl apply -f k8s/networkpolicy-client-ingress.yaml
+#
+# Note this is a default-deny for the SERVICE pods' ingress: once applied, only labelled
+# namespaces (plus the kubelet's probe traffic, which does not traverse a NetworkPolicy) get in.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llm-sandbox-service-ingress
+  namespace: llm-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      app: llm-sandbox
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              llm-sandbox/client: "true"
+      ports:
+        - protocol: TCP
+          port: 8900

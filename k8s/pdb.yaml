@@ -1,0 +1,12 @@
+# Keeps a node drain / cluster upgrade from taking both service replicas at once.
+# Only selects the service — session pods are ephemeral and must stay evictable.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: llm-sandbox
+  namespace: llm-sandbox
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: llm-sandbox

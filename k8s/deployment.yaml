@@ -1,5 +1,10 @@
 # The service (trusted control plane). Runs on NORMAL nodes — no gVisor, no ai-sandbox
 # toleration. Only the session pods it spawns land on the gVisor node group.
+#
+# The service talks to the apiserver in-process (httpx + a websocket for exec), so this pod
+# holds no kubectl binary and forks nothing per request — which is why the memory limit below
+# can be this small. It is stateless (a session id maps to a pod name by construction), so
+# replicas scale freely.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,7 +13,13 @@ metadata:
   labels:
     app: llm-sandbox
 spec:
-  replicas: 1
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: llm-sandbox
@@ -18,19 +29,39 @@ spec:
         app: llm-sandbox
     spec:
       serviceAccountName: llm-sandbox
+      # An in-flight exec can legitimately run for a caller-set timeout; give it room to
+      # finish on a rollout instead of severing it at the 30s default.
+      terminationGracePeriodSeconds: 90
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: llm-sandbox
+      # CHANGEME (private registry only): the pull secret for the SERVICE image. Session pods
+      # get theirs from SANDBOX_K8S_IMAGE_PULL_SECRETS below.
+      # imagePullSecrets:
+      #   - name: registry
       containers:
         - name: llm-sandbox
-          # CHANGEME: your registry — built from ./Dockerfile
-          image: your-registry.example.com/llm-sandbox:latest
+          # CHANGEME: your registry — built from ./Dockerfile.
+          # Use an immutable tag or a digest, never `latest`: it is what makes a rollback a
+          # one-line edit instead of a rebuild.
+          image: your-registry.example.com/llm-sandbox:v0.1.0
           ports:
             - containerPort: 8900
           env:
             - name: SANDBOX_PROVIDER
               value: "k8s"
             # CHANGEME: your registry — built from ./sandbox.Dockerfile; the image session
-            # pods run. Must be pullable by the ai-sandbox node.
+            # pods run. Must be pullable by the ai-sandbox node. Immutable tag: session pods
+            # use imagePullPolicy IfNotPresent, so a moving tag would go stale on warm nodes.
             - name: SANDBOX_IMAGE
-              value: "your-registry.example.com/llm-sandbox-runtime:latest"
+              value: "your-registry.example.com/llm-sandbox-runtime:v0.1.0"
+            # Uncomment for a private registry (comma-separated secret names, in this namespace).
+            # - name: SANDBOX_K8S_IMAGE_PULL_SECRETS
+            #   value: "registry"
             # Session pods go to the service's own namespace.
             - name: SANDBOX_K8S_NAMESPACE
               valueFrom:
@@ -39,14 +70,32 @@ spec:
             # gVisor placement (RuntimeClass / nodeSelector / toleration) comes from the
             # code defaults, which match the stage cluster. On a different cluster set
             # SANDBOX_K8S_RUNTIME_CLASS / SANDBOX_K8S_NODE_SELECTOR / SANDBOX_K8S_TOLERATION.
+            # Ceilings on what a caller may request per session; the namespace ResourceQuota
+            # (k8s/quota.yaml) is the second line of defence behind these.
+            - name: SANDBOX_MAX_MEMORY_MB
+              value: "4096"
+            - name: SANDBOX_MAX_CPUS
+              value: "2"
+            - name: SANDBOX_MAX_CONCURRENCY
+              value: "32"
+            # Live sessions PER REPLICA — 2 replicas × 24 = 48 session pods, which with the
+            # 2 service pods is exactly the quota's count/pods: 50. Raise both together.
+            - name: SANDBOX_MAX_SESSIONS
+              value: "24"
+            # Off in prod: command/code bodies are untrusted LLM output and may carry
+            # customer data — not something to fan out into cluster log retention.
+            - name: SANDBOX_LOG_PAYLOADS
+              value: "0"
             - name: LLM_SANDBOX_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: llm-sandbox
                   key: token
-            # kubectl writes its discovery cache under $HOME — point it at the tmpfs.
+            # Root filesystem is read-only; keep stray library temp/cache writes on the tmpfs.
             - name: HOME
               value: "/tmp"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
           volumeMounts:
             - name: tmp
               mountPath: /tmp
@@ -54,12 +103,19 @@ spec:
             requests:
               cpu: 100m
               memory: 128Mi
+              ephemeral-storage: 64Mi
             limits:
-              cpu: 500m
-              memory: 256Mi
+              # Headroom for SANDBOX_MAX_CONCURRENCY streams each buffering up to
+              # SANDBOX_MAX_OUTPUT_BYTES; steady state is ~100Mi.
+              cpu: "1"
+              memory: 512Mi
+              ephemeral-storage: 256Mi
+          # Liveness is shallow on purpose (is the process serving?). Readiness is the one
+          # that checks the apiserver + RBAC, so a broken Role drains this pod from the
+          # Service instead of restart-looping it.
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8900
             initialDelaySeconds: 3
             periodSeconds: 10
@@ -71,10 +127,15 @@ spec:
             periodSeconds: 30
           securityContext:
             runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
             capabilities:
               drop: ["ALL"]
       volumes:
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 64Mi

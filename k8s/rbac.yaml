@@ -13,7 +13,9 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    # deletecollection backs the periodic sweep of finished session pods — one call instead
+    # of list+delete-each. `watch` is not used (readiness is a short poll) but is harmless.
+    verbs: ["get", "list", "watch", "create", "delete", "deletecollection"]
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create"]

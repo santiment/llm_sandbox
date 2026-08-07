@@ -1,6 +1,18 @@
 # Everything (service + session pods) lives in one namespace so the Role below can be
 # namespace-scoped — the service never needs cluster-wide rights.
+#
+# PodSecurity `baseline` is the ceiling on what anything here may ask for. It matters because
+# the service holds `create pods` in this namespace: if the service were ever compromised,
+# admission — not our own code — is what stops it creating a privileged/hostPath pod and
+# escaping to the node. `restricted` is deliberately NOT used: session pods run as root
+# inside the sandbox (gVisor is the boundary, not the uid) and restricted would reject them.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: llm-sandbox
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    # Surfaces "this would fail under restricted" in audit logs without blocking anything.
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
