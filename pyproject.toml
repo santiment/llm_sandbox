@@ -1,18 +1,41 @@
 [project]
 name = "llm-sandbox"
 version = "0.1.0"
-description = "Provider-agnostic code-execution sandbox sidecar (gVisor / ...) exposing one HTTP interface to store files and run shell, Python and JavaScript."
+description = "Provider-agnostic code-execution sandbox sidecar (gVisor / ...) exposing one HTTP interface to store files and run shell and Python."
 requires-python = ">=3.11"
+# Deliberately plain `uvicorn`, not `uvicorn[standard]`: the extras (uvloop, httptools,
+# watchfiles, PyYAML, python-dotenv) add compiled deps and image weight for no gain here —
+# this service is latency-bound on the apiserver, not on HTTP parsing. `websockets` is a
+# direct dependency because the k8s provider uses it as a CLIENT for the pod exec stream.
 dependencies = [
     "fastapi>=0.110",
-    "uvicorn[standard]>=0.29",
+    "uvicorn>=0.29",
     "pydantic>=2.6",
     "httpx>=0.27",
+    "websockets>=13",
 ]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.uv]
+# Supply-chain freshness window: uv NEVER resolves/installs a distribution published
+# after this timestamp, so a freshly-hijacked release can't reach us before the
+# ecosystem notices. Keep it ~2 weeks behind today; move it forward by running
+# ./update_safe_deps_date.sh (which sets it to today - 14 days), then `uv lock`.
+exclude-newer = "2026-07-24T00:00:00Z"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Test-only. The images build with `uv sync --no-dev`, so none of this ships.
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

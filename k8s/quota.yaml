@@ -1,0 +1,44 @@
+# Blast radius for the sandbox namespace.
+#
+# `memory_mb` and `cpus` are fields on the public POST /sessions body, so they are
+# attacker-controlled. The service clamps them (SANDBOX_MAX_MEMORY_MB / SANDBOX_MAX_CPUS),
+# but that is application code — this is the part the cluster enforces even if the service
+# is compromised or misconfigured. Without it, a caller looping create() can pin the whole
+# ai-sandbox node group.
+#
+# TUNE THESE to the ai-sandbox instance group's real capacity before applying.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: llm-sandbox
+  namespace: llm-sandbox
+spec:
+  hard:
+    # The hard ceiling on concurrent sessions (plus the 2 service replicas).
+    count/pods: "50"
+    requests.cpu: "8"
+    requests.memory: 8Gi
+    limits.cpu: "64"
+    limits.memory: 96Gi
+---
+# A ResourceQuota that names requests/limits makes them mandatory for every pod in the
+# namespace; this supplies sane defaults and, more importantly, a per-container `max` that
+# rejects an oversized session at admission.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: llm-sandbox
+  namespace: llm-sandbox
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1"
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 64Mi
+      # Keep in step with SANDBOX_MAX_CPUS / SANDBOX_MAX_MEMORY_MB in k8s/deployment.yaml.
+      max:
+        cpu: "2"
+        memory: 4Gi

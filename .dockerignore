@@ -1,0 +1,22 @@
+# Never bake secrets or local state into images.
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+.claude
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.egg-info
+**/*.egg-info
+.DS_Store
+k8s/
+.pytest_cache
+# tests/ stays IN the context: the Dockerfile `test` target copies it. The runtime stages
+# never COPY it, so shipped images are unaffected.
+docker-compose.yml
+README.md
+LICENSE
+run.sh

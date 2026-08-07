@@ -1,0 +1,61 @@
+# Egress control for session pods — the k8s equivalent of the docker provider's
+# `--network none` default. Requires a CNI that enforces NetworkPolicy (calico/cilium/…);
+# verify on the cluster, otherwise these are silently inert.
+#
+# Note: the apiserver exec stream (how the service drives sessions) goes
+# apiserver→kubelet→runtime, NOT through the pod network — deny-all does not break it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llm-sandbox-session-default-deny
+  namespace: llm-sandbox
+spec:
+  # Every session pod: no ingress, no egress.
+  podSelector:
+    matchLabels:
+      app: llm-sandbox-session
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llm-sandbox-session-allow-egress
+  namespace: llm-sandbox
+spec:
+  # Sessions created with network=true get this label from the provider: public internet
+  # + DNS only — cluster/VPC ranges and the cloud metadata service stay blocked.
+  podSelector:
+    matchLabels:
+      llm-sandbox/network: "true"
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              # VERIFY: this is the CoreDNS pod label on the cluster. If it does not match,
+              # network=true sessions get no DNS and every hostname lookup fails.
+              #   kubectl -n kube-system get pods -l k8s-app=kube-dns
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16     # link-local, incl. the cloud metadata service
+              # kops does NOT use RFC1918 for the cluster by default: nonMasqueradeCIDR is
+              # 100.64.0.0/10 (services 100.64.0.0/13, pods 100.96.0.0/11). Without this
+              # line a network=true session can reach the kube-apiserver ClusterIP and every
+              # other pod in the cluster. VERIFY the range on your cluster and adjust:
+              #   kubectl get svc kubernetes -o jsonpath='{.spec.clusterIP}'
+              - 100.64.0.0/10
+# IPv6 needs no `except` entry: NetworkPolicy egress is an allowlist and `0.0.0.0/0` matches
+# v4 only, so on a dual-stack cluster v6 egress stays denied by the default-deny above. If
+# sessions ever need v6 internet, that requires an explicit `::/0` rule with its own excepts.
