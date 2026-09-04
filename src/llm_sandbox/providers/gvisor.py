@@ -135,3 +135,11 @@ class GvisorProvider(SessionOpsMixin):
 
     async def destroy(self, session_id: str) -> None:
         await self._docker("rm", "-f", self._container(session_id), timeout=30, control=True)
+
+    async def live_session_ids(self) -> set[str] | None:
+        rc, out, _err = await self._docker("ps", "--filter", f"name=^{_NAME_PREFIX}",
+                                           "--format", "{{.Names}}", timeout=15, control=True)
+        if rc != 0:
+            return None
+        return {line[len(_NAME_PREFIX):] for line in out.decode(errors="replace").split()
+                if line.startswith(_NAME_PREFIX)}

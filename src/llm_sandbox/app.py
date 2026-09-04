@@ -7,13 +7,11 @@ Run:  uv run uvicorn llm_sandbox.app:app --host 0.0.0.0 --port 8900   (see READM
 from __future__ import annotations
 
 import asyncio
-import base64
 import hmac
 import json
 import logging
 import sys
 import time
-import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -95,23 +93,27 @@ def _human_bytes(n: int) -> str:
     return f"{n / 1_048_576:.1f}MB"
 
 
-def _metrics(text: str) -> str:
-    """Compact content summary: bytes · lines · rough token estimate (~chars÷4)."""
-    text = text or ""
-    nbytes = len(text.encode("utf-8", errors="replace"))
-    nlines = text.count("\n") + 1 if text else 0
-    ntokens = (len(text) + 3) // 4
-    return f"{_human_bytes(nbytes)} · {nlines}L · ~{ntokens}tok"
+def _metrics(*texts: str) -> str:
+    """Compact content summary: bytes · lines · rough token estimate (~chars÷4). Several
+    texts (stdout + stderr) are summed without concatenating them, and the byte count skips
+    the encode pass for ASCII — these run on every request against up-to-megabyte payloads."""
+    nbytes = nlines = nchars = 0
+    for text in texts:
+        if not text:
+            continue
+        nbytes += len(text) if text.isascii() else len(text.encode("utf-8", errors="replace"))
+        nlines += text.count("\n") + 1
+        nchars += len(text)
+    return f"{_human_bytes(nbytes)} · {nlines}L · ~{(nchars + 3) // 4}tok"
 
 
 def _payload_metrics(content: str, encoding: str) -> str:
-    """Size summary for a file payload. base64 → report decoded byte size (binary)."""
+    """Size summary for a file payload. base64 → decoded byte size, computed from the length
+    (chars×3/4 minus padding) rather than by actually decoding megabytes for a log line."""
     if encoding == "base64":
-        try:
-            raw = base64.b64decode(content, validate=False)
-        except Exception:
-            return f"{_human_bytes(len(content.encode()))} · base64"
-        return f"{_human_bytes(len(raw))} · binary/base64"
+        stripped = content.rstrip("=\n\r ")
+        raw = len(stripped) * 3 // 4
+        return f"{_human_bytes(raw)} · binary/base64"
     return _metrics(content)
 
 
@@ -144,11 +146,12 @@ class SessionSlots:
     ``limit <= 0`` disables the cap entirely.
     """
 
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, recount=None) -> None:
         self._limit = limit
         self._deadlines: dict[str, float] = {}  # session_id -> monotonic reap time
         self._pending = 0                       # creates in flight, no session id yet
         self._lock = asyncio.Lock()
+        self._recount = recount                 # async () -> set[str] | None (provider hook)
 
     def _live(self) -> int:
         now = time.monotonic()
@@ -163,6 +166,8 @@ class SessionSlots:
             return
         async with self._lock:
             live = self._live()
+            if live >= self._limit and self._recount is not None:
+                live = await self._resync()
             if live >= self._limit:
                 log.warning("REJECT   create: %d/%d live sessions on this replica",
                             live, self._limit)
@@ -171,6 +176,27 @@ class SessionSlots:
                     detail=f"session limit reached ({live}/{self._limit} live on this "
                            "replica) — retry once a running session finishes")
             self._pending += 1
+
+    async def _resync(self) -> int:
+        """Only when the cap is hit: ask the backend which of the sessions we hold slots for
+        still exist, and drop the rest. Any replica can serve any request, so a DELETE that
+        lands on a sibling never reaches our ``release`` — without this, those slots would
+        stay taken until their deadline (up to SANDBOX_MAX_SESSION_SECONDS) and a busy
+        replica would 429 with capacity to spare."""
+        try:
+            actual = await asyncio.wait_for(self._recount(), timeout=10)
+        except Exception as exc:
+            log.warning("slot resync failed, keeping local view: %r", exc)
+            return self._live()
+        if actual is None:
+            return self._live()
+        stale = [sid for sid in self._deadlines if sid not in actual]
+        for sid in stale:
+            self._deadlines.pop(sid, None)
+        if stale:
+            log.info("RESYNC   dropped %d slot(s) for sessions destroyed via another replica",
+                     len(stale))
+        return self._live()
 
     def commit(self, sid: str, timeout_seconds: int) -> None:
         """Creation succeeded: turn the reservation into a real, expiring slot."""
@@ -189,7 +215,7 @@ class SessionSlots:
         self._deadlines.pop(sid, None)
 
 
-slots = SessionSlots(cfg.max_sessions)
+slots = SessionSlots(cfg.max_sessions, recount=provider.live_session_ids)
 
 
 class BodyLimitMiddleware:
@@ -348,30 +374,25 @@ async def exec_command(sid: SessionId, req: ExecRequest):
     r = await provider.exec(sid, req.command, timeout_seconds=timeout_seconds,
                             workdir=req.workdir)
     log.info("EXEC     session=%s  exit=%s  dur=%sms  out=[%s]  truncated=%s", sid, r.exit_code,
-             r.duration_ms, _metrics(r.stdout + r.stderr), r.truncated)
+             r.duration_ms, _metrics(r.stdout, r.stderr), r.truncated)
     return r
 
 
 @app.post("/sessions/{sid}/run", response_model=ExecResult, dependencies=[Depends(_auth)])
 async def run_code(sid: SessionId, req: RunRequest):
     """Run Python (the only language in ``_RUNNERS`` — the image is python-only by design):
-    write the code to a file in the session, then execute it. Composed on write_file + exec
-    so every provider supports it uniformly."""
+    save the code to a scratch file in the session and execute it, in one exec. Implemented
+    once in ``SessionOpsMixin`` so every provider behaves identically."""
     # The full executed program is logged (preview) — this is the audit trail for "what ran".
     log.info("RUN      session=%s  lang=%s  code (%s):\n%s", sid, req.language,
              _metrics(req.code), _block(req.code, _CODE_PREVIEW))
     ext, interp = _RUNNERS[req.language]
-    # Per-call path, and OUTSIDE /workspace. A constant name raced: two concurrent /run calls
-    # on one session (the agent fans out) would overwrite each other's file between write and
-    # exec, so one call silently ran the other's code. /tmp also keeps these scratch files out
-    # of the workspace listing the model reads back — cwd is still /workspace, so the script's
-    # own relative paths resolve exactly as before.
-    path = f"/tmp/_run_{req.language}_{uuid.uuid4().hex}.{ext}"
     timeout_seconds = min(req.timeout_seconds, cfg.max_exec_seconds)
-    await provider.write_file(sid, path, req.code, encoding="utf-8")
-    r = await provider.exec(sid, f"{interp} {path}", timeout_seconds=timeout_seconds)
+    # One round-trip: the script travels on stdin and the same exec saves and runs it.
+    r = await provider.run_script(sid, req.code, interpreter=interp, ext=ext,
+                                  timeout_seconds=timeout_seconds)
     log.info("RUN      session=%s  lang=%s  exit=%s  dur=%sms  out=[%s]", sid, req.language,
-             r.exit_code, r.duration_ms, _metrics(r.stdout + r.stderr))
+             r.exit_code, r.duration_ms, _metrics(r.stdout, r.stderr))
     return r
 
 

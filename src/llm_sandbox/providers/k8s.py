@@ -391,7 +391,7 @@ class K8sProvider(SessionOpsMixin):
         """Poll until the pod reports Ready. Bails out early on a waiting reason that can
         never clear (bad image, bad config) instead of sitting out the full timeout."""
         deadline = time.monotonic() + self.create_timeout
-        delay, reason = 0.25, "unknown"
+        delay, reason = 0.1, "unknown"
         while time.monotonic() < deadline:
             status, pod = await self.api.request("GET", self._pods_path(name), timeout=10)
             if status < 400:
@@ -409,7 +409,7 @@ class K8sProvider(SessionOpsMixin):
                 if phase in ("Failed", "Succeeded"):
                     break
             await asyncio.sleep(delay)
-            delay = min(delay * 1.5, 2.0)  # tight at first (warm node ≈ 1s), then back off
+            delay = min(delay * 1.5, 1.0)  # tight at first (warm node ≈ 1s), then back off
         hint = ""
         if any(w in reason for w in ("ErrImagePull", "ImagePullBackOff", "InvalidImageName")):
             hint = (f" — image {image!r} is not pullable from the cluster; push it to your "
@@ -429,6 +429,17 @@ class K8sProvider(SessionOpsMixin):
                 timeout=30)
         if status >= 400 and status != 404:
             log.warning("destroy %s failed (%s)", session_id, api_error(status, payload))
+
+    async def live_session_ids(self) -> set[str] | None:
+        status, payload = await self.api.request(
+            "GET", self._pods_path(),
+            params={"labelSelector": f"app={_SESSION_LABEL}",
+                    "fieldSelector": "status.phase!=Succeeded,status.phase!=Failed"},
+            timeout=15)
+        if status >= 400:
+            return None
+        names = (item.get("metadata", {}).get("name", "") for item in payload.get("items", []))
+        return {n[len(_NAME_PREFIX):] for n in names if n.startswith(_NAME_PREFIX)}
 
     # --- exec transport ----------------------------------------------------------------
 

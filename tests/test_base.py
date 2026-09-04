@@ -65,3 +65,16 @@ async def test_exec_timeout_floor_is_one_second():
     r = Recorder()
     await r.exec("s", "true", timeout_seconds=0)
     assert r.calls[0][0][3] == "1"
+
+
+async def test_run_script_is_one_exec_with_the_code_on_stdin():
+    r = Recorder()
+    await r.run_script("s", "print(1)", interpreter="python3", ext="py", timeout_seconds=9)
+    cmd, stdin, timeout = r.calls[0]
+    assert len(r.calls) == 1
+    assert cmd[:2] == ("sh", "-c")
+    script = cmd[2]
+    assert script.startswith("cat > /tmp/_run_") and ".py && cd /workspace && timeout -k 1 9 python3 /tmp/_run_" in script
+    assert script.endswith("; rc=$?; rm -f " + script.split("cat > ")[1].split(" ")[0] + "; exit $rc")
+    assert stdin == b"print(1)"
+    assert timeout == 14

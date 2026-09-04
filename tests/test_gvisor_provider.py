@@ -94,3 +94,11 @@ async def test_exec_output_is_capped_at_the_stream():
     r = await p.exec("abc", "yes", timeout_seconds=5)
     assert seen["max_bytes"] == 11
     assert (len(r.stdout), r.truncated) == (10, True)
+
+
+async def test_live_session_ids_strips_the_prefix_and_tolerates_a_dead_daemon():
+    p = provider()
+    stub(p, out=b"llmsbx_aaaaaaaaaaaaaaaa\nllmsbx_bbbbbbbbbbbbbbbb\nunrelated\n")
+    assert await p.live_session_ids() == {"aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"}
+    stub(p, rc=1, err=b"Cannot connect to the Docker daemon")
+    assert await p.live_session_ids() is None

@@ -160,6 +160,8 @@ CoreDNS actually carries the `k8s-app: kube-dns` label the DNS rule selects.
 
 Operational notes:
 
+- **Per-call latency:** `run` is a single exec (the script arrives on stdin, the same shell
+  saves and runs it) — one TLS + WebSocket handshake to the apiserver, not two.
 - **Session create latency:** ~1–3 s when the runtime image is cached on the sandbox node;
   the first pull after a node rotation takes tens of seconds (image ≈ 240 MB). A pre-pull
   DaemonSet on the ai-sandbox group removes even that.
@@ -237,7 +239,9 @@ gVisor (`runsc`) is the security boundary for untrusted LLM-written code.
   and `max_bytes` must be positive (a negative one would reach `head -c` as "all but N").
 - Session **count** capped per replica (`SANDBOX_MAX_SESSIONS`, default 24 → 429 when full),
   so a create loop can't pin the node group; on k8s the namespace ResourceQuota
-  (`k8s/quota.yaml`) enforces the same ceiling cluster-side.
+  (`k8s/quota.yaml`) enforces the same ceiling cluster-side. When a replica hits its cap it
+  first re-checks its slots against the backend, so a DELETE that landed on a sibling
+  replica frees the slot here too instead of only at the session's deadline.
 - Ephemeral: a session is one container/pod, destroyed on `DELETE` or auto-reaped after
   `timeout_seconds`. Never reuse a session across users/tasks.
 - Bearer auth (`LLM_SANDBOX_TOKEN`) between callers and the service.

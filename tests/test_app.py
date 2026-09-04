@@ -42,6 +42,15 @@ class FakeProvider:
                                         timeout_seconds=timeout_seconds, workdir=workdir)))
         return ExecResult(stdout="ok", stderr="", exit_code=0, duration_ms=1)
 
+    async def run_script(self, sid, code, *, interpreter, ext, timeout_seconds):
+        self.calls.append(("run_script", dict(sid=sid, code=code, interpreter=interpreter, ext=ext,
+                                              timeout_seconds=timeout_seconds)))
+        return ExecResult(stdout="42", stderr="", exit_code=0, duration_ms=1)
+
+    async def live_session_ids(self):
+        self.calls.append(("live_session_ids", None))
+        return set(self.sessions)
+
     async def write_file(self, sid, path, content, *, encoding="utf-8"):
         self.calls.append(("write_file", dict(sid=sid, path=path, content=content,
                                               encoding=encoding)))
@@ -61,7 +70,8 @@ class FakeProvider:
 def client(monkeypatch):
     fake = FakeProvider()
     monkeypatch.setattr(appmod, "provider", fake)
-    monkeypatch.setattr(appmod, "slots", appmod.SessionSlots(appmod.cfg.max_sessions))
+    monkeypatch.setattr(appmod, "slots", appmod.SessionSlots(appmod.cfg.max_sessions,
+                                                             recount=fake.live_session_ids))
     with TestClient(appmod.app) as c:
         c.fake = fake
         yield c
@@ -119,9 +129,12 @@ def test_exec_and_run_timeouts_are_clamped(client):
     sid = create(client)
     client.post(f"/sessions/{sid}/exec", json={"command": "true", "timeout_seconds": 10**6}, headers=AUTH)
     assert client.fake.last("exec")["timeout_seconds"] == 30  # SANDBOX_MAX_EXEC_SECONDS
-    client.post(f"/sessions/{sid}/run", json={"language": "python", "code": "1", "timeout_seconds": 999},
-                headers=AUTH)
-    assert client.fake.last("exec")["timeout_seconds"] == 30
+    r = client.post(f"/sessions/{sid}/run", json={"language": "python", "code": "1", "timeout_seconds": 999},
+                    headers=AUTH)
+    assert r.json()["stdout"] == "42"
+    run = client.fake.last("run_script")
+    assert (run["timeout_seconds"], run["interpreter"], run["ext"], run["code"]) == (30, "python3", "py", "1")
+    assert not [c for c in client.fake.calls if c[0] == "write_file"]  # one round-trip, no write
     r = client.post(f"/sessions/{sid}/exec", json={"command": "true", "timeout_seconds": -1}, headers=AUTH)
     assert r.status_code == 422
 
@@ -182,6 +195,19 @@ def test_session_cap_returns_429_and_delete_frees_a_slot(client):
     assert r.headers["Retry-After"] == "5"
     assert client.delete(f"/sessions/{a}", headers=AUTH).status_code == 200
     create(client)
+
+
+def test_slots_resync_with_the_backend_when_the_cap_is_hit(client):
+    """A DELETE served by a sibling replica never reaches this replica's release(); at the cap
+    we ask the backend what still exists and drop the rest instead of 429ing for up to a full
+    session lifetime."""
+    a = create(client)
+    create(client)
+    client.fake.sessions.discard(a)                       # destroyed "via another replica"
+    assert not [c for c in client.fake.calls if c[0] == "live_session_ids"]  # never off the 429 path
+    create(client)                                       # would have been a 429
+    assert [c for c in client.fake.calls if c[0] == "live_session_ids"]
+    assert client.post("/sessions", json={}, headers=AUTH).status_code == 429  # genuinely full now
 
 
 # --- image allowlist ------------------------------------------------------------------------

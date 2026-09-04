@@ -219,6 +219,17 @@ async def test_create_unschedulable_points_at_the_node_group():
         await provider(api, create_timeout=1).create()
 
 
+async def test_live_session_ids_lists_unfinished_session_pods():
+    items = {"items": [{"metadata": {"name": "llmsbx-aaaaaaaaaaaaaaaa"}},
+                       {"metadata": {"name": "llmsbx-bbbbbbbbbbbbbbbb"}},
+                       {"metadata": {"name": "something-else"}}]}
+    api = FakeApi([("GET", "/pods", (200, items))])
+    assert await provider(api).live_session_ids() == {"aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"}
+    _m, _p, params = api.calls[0][0], api.calls[0][1], None
+    api = FakeApi([("GET", "/pods", (403, {"message": "forbidden"}))])
+    assert await provider(api).live_session_ids() is None
+
+
 async def test_destroy_tolerates_a_missing_pod():
     api = FakeApi([("DELETE", "/pods/", (404, {"message": "not found"}))])
     await provider(api).destroy("abc")  # must not raise
@@ -260,6 +271,28 @@ async def test_write_file_streams_stdin_and_half_closes():
     assert seen["body"] == b"payload"
     assert "stdin=true" in seen["url"]
     assert "cat" in seen["url"]          # the redirect the mixin builds
+
+
+async def test_run_script_streams_the_code_and_runs_it_in_one_exec():
+    seen: dict = {}
+
+    async def handler(ws):
+        body = bytearray()
+        async for frame in ws:
+            if frame[0] == CH_CLOSE and frame[1] == CH_STDIN:
+                break
+            if frame[0] == CH_STDIN:
+                body += frame[1:]
+        seen["body"], seen["url"] = bytes(body), ws.request.path
+        await ws.send(bytes([CH_STDOUT]) + b"42\n")
+        await ws.send(bytes([CH_ERROR]) + SUCCESS)
+
+    async with exec_server(handler) as port:
+        r = await provider(FakeApi(ws_port=port)).run_script(
+            "s1", "print(6*7)", interpreter="python3", ext="py", timeout_seconds=5)
+    assert (r.stdout, r.exit_code) == ("42\n", 0)
+    assert seen["body"] == b"print(6*7)"
+    assert "cat+%3E+%2Ftmp%2F_run_" in seen["url"] and "timeout+-k+1+5+python3" in seen["url"]
 
 
 async def test_write_file_rejects_a_cluster_without_v5():

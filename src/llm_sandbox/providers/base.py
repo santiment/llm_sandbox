@@ -18,6 +18,7 @@ import base64
 import json
 import shlex
 import time
+import uuid
 from typing import Optional, Protocol, runtime_checkable
 
 from ..models import ExecResult, FileEntry
@@ -144,6 +145,32 @@ class SessionOpsMixin:
         # 137 = timed out and ignored TERM. Our own wait is only the backstop behind it.
         rc, out, err = await self._exec_cli(session_id, "timeout", "-k", "1", str(seconds),
                                             "sh", "-c", full, timeout=seconds + 2)
+        return self._result(rc, out, err, start)
+
+    async def run_script(self, session_id, code, *, interpreter, ext,
+                         timeout_seconds=60) -> ExecResult:
+        """Write ``code`` to a scratch file and run it — in ONE round-trip. A write followed
+        by an exec costs two forks (docker) or two TLS+WebSocket handshakes (k8s) per call;
+        here the script arrives on stdin and the same shell that saves it runs it.
+
+        Per-call path, OUTSIDE /workspace: a constant name raced (two concurrent runs on one
+        session overwrote each other between write and exec), and /tmp keeps scratch files
+        out of the listing the model reads back. The file is removed afterwards whatever the
+        exit code; cwd is still /workspace, so the script's relative paths resolve as before.
+        """
+        seconds = max(1, int(timeout_seconds))
+        path = shlex.quote(f"/tmp/_run_{uuid.uuid4().hex}.{ext}")
+        script = (f"cat > {path} && cd {shlex.quote(WORKDIR)} && "
+                  f"timeout -k 1 {seconds} {shlex.quote(interpreter)} {path}; "
+                  f"rc=$?; rm -f {path}; exit $rc")
+        start = time.monotonic()
+        # +5 not +2: the deadline only starts once `cat` has the whole script, and the
+        # backstop must not fire while a large payload is still streaming in.
+        rc, out, err = await self._exec_cli(session_id, "sh", "-c", script,
+                                            stdin=code.encode("utf-8"), timeout=seconds + 5)
+        return self._result(rc, out, err, start)
+
+    def _result(self, rc: int, out: bytes, err: bytes, start: float) -> ExecResult:
         dur_ms = int((time.monotonic() - start) * 1000)
         stdout, t1 = cap_output(out, self.max_output_bytes)
         stderr, t2 = cap_output(err, self.max_output_bytes)
@@ -217,6 +244,17 @@ class SandboxProvider(Protocol):
     async def exec(self, session_id: str, command: str, *, timeout_seconds: int,
                    workdir: Optional[str] = None) -> ExecResult:
         """Run a shell command line (awk/sed/bash/...) in the session."""
+        ...
+
+    async def run_script(self, session_id: str, code: str, *, interpreter: str, ext: str,
+                         timeout_seconds: int) -> ExecResult:
+        """Save ``code`` to a scratch file in the session and run it with ``interpreter``."""
+        ...
+
+    async def live_session_ids(self) -> set[str] | None:
+        """Ids of the sessions that currently exist on the backend, or ``None`` if that
+        cannot be determined right now. Lets the HTTP layer drop slots for sessions that
+        were destroyed via another replica (see ``SessionSlots``)."""
         ...
 
     async def write_file(self, session_id: str, path: str, content: str, *,
