@@ -230,10 +230,12 @@ class K8sProvider(SessionOpsMixin):
         self.reap_interval = reap_interval
         self.api = api or ApiServer()
         self.namespace = namespace or self.api.default_namespace()
-        # Bounds how many apiserver streams are open at once. Cheap now that a call is a
-        # socket rather than a process, but still the backstop against a caller opening
-        # thousands of concurrent execs.
+        # Bounds how many apiserver exec streams are open at once. Cheap now that a call is
+        # a socket rather than a process, but still the backstop against a caller opening
+        # thousands of concurrent execs. Create/destroy take a separate lane so a burst of
+        # long execs cannot hold up a DELETE (or a create) behind them.
         self._sem = asyncio.Semaphore(max_concurrency)
+        self._ctl_sem = asyncio.Semaphore(8)
         self._reaper: asyncio.Task | None = None
 
     # --- lifecycle -------------------------------------------------------------------
@@ -363,7 +365,7 @@ class K8sProvider(SessionOpsMixin):
         name = self._pod(session_id)
         image = image or self.default_image
         manifest = self._manifest(name, image, timeout_seconds, network, memory_mb, cpus)
-        async with self._sem:
+        async with self._ctl_sem:
             status, payload = await self.api.request(
                 "POST", self._pods_path(), body=manifest, timeout=30)
         if status >= 400:
@@ -420,7 +422,7 @@ class K8sProvider(SessionOpsMixin):
         raise RuntimeError(f"sandbox pod not ready ({reason or 'unknown'}){hint}")
 
     async def destroy(self, session_id: str) -> None:
-        async with self._sem:
+        async with self._ctl_sem:
             status, payload = await self.api.request(
                 "DELETE", self._pods_path(self._pod(session_id)),
                 params={"gracePeriodSeconds": "0", "propagationPolicy": "Background"},

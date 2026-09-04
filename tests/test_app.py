@@ -51,7 +51,7 @@ class FakeProvider:
         return "data", "utf-8", False
 
     async def list_files(self, sid, path):
-        return [FileEntry(name="a", path=f"{path}/a", is_dir=False, size=1)]
+        return [FileEntry(name="a", path=f"{path}/a", is_dir=False, size=1)], True
 
     def last(self, kind):
         return [args for k, args in self.calls if k == kind][-1]
@@ -203,3 +203,11 @@ def test_image_override_is_an_allowlist(client, monkeypatch):
 def test_no_image_means_the_default(client):
     create(client)
     assert client.fake.last("create")["image"] == appmod.cfg.default_image
+
+
+def test_list_files_reports_truncation(client):
+    sid = create(client)
+    r = client.get(f"/sessions/{sid}/files/list", params={"path": "/workspace"}, headers=AUTH)
+    assert r.status_code == 200
+    assert r.json()["truncated"] is True
+    assert r.json()["entries"][0]["name"] == "a"

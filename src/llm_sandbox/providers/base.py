@@ -23,7 +23,10 @@ from typing import Optional, Protocol, runtime_checkable
 from ..models import ExecResult, FileEntry
 
 WORKDIR = "/workspace"
-TIMEOUT_EXIT = 124  # conventional "timed out" exit code
+TIMEOUT_EXIT = 124  # conventional "timed out" exit code (GNU timeout's, too)
+KILLED_EXIT = 137   # 128+SIGKILL: GNU timeout's code when the command ignored TERM
+LIST_MAX_ENTRIES = 2000  # list_files returns at most this many entries (+ truncated flag)
+_READ_CHUNK = 64 * 1024
 
 
 def clamp_resources(memory_mb: int, cpus: float, *, max_memory_mb: int,
@@ -48,31 +51,69 @@ def cap_output(data: bytes | str, limit: int) -> tuple[str, bool]:
     return data, truncated
 
 
-async def run_cli(*argv: str, stdin: bytes | None = None,
-                  timeout: float | None = None) -> tuple[int, bytes, bytes]:
-    """Run a CLI command (docker/kubectl/…). Returns (exit_code, stdout, stderr); on
-    timeout the process is killed and the exit code is ``TIMEOUT_EXIT``."""
+async def run_cli(*argv: str, stdin: bytes | None = None, timeout: float | None = None,
+                  max_bytes: int | None = None) -> tuple[int, bytes, bytes]:
+    """Run a CLI command (docker/…). Returns (exit_code, stdout, stderr); on timeout the
+    process is killed and the exit code is ``TIMEOUT_EXIT``.
+
+    stdout/stderr are read incrementally and each kept to ``max_bytes`` — the rest is drained
+    and dropped. ``communicate()`` would buffer everything the child ever printed, so a
+    ``yes`` running for its whole timeout would grow the service's heap by gigabytes before
+    any cap could apply. Pass ``max_output_bytes + 1`` so truncation stays detectable.
+    """
     proc = await asyncio.create_subprocess_exec(
         *argv,
-        stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+        stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    out, err = bytearray(), bytearray()
+
+    async def pump(stream, buf: bytearray) -> None:
+        while True:
+            chunk = await stream.read(_READ_CHUNK)
+            if not chunk:
+                return
+            if max_bytes is None:
+                buf += chunk
+            else:
+                room = max_bytes - len(buf)
+                if room > 0:
+                    buf += chunk[:room]
+
+    async def feed() -> None:
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(stdin)
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # child exited before reading everything; its exit code tells the story
+        finally:
+            proc.stdin.close()
+
+    tasks = [pump(proc.stdout, out), pump(proc.stderr, err), proc.wait()]
+    if stdin is not None:
+        tasks.append(feed())
     try:
-        out, err = await asyncio.wait_for(proc.communicate(input=stdin), timeout=timeout)
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
         return TIMEOUT_EXIT, b"", b"sandbox: operation timed out"
-    return proc.returncode if proc.returncode is not None else -1, out, err
+    return proc.returncode if proc.returncode is not None else -1, bytes(out), bytes(err)
 
 
-# python3 is in the sandbox image → reliable JSON listing (beats parsing `ls`).
+# python3 is in the sandbox image → reliable JSON listing (beats parsing `ls`). Bounded:
+# a directory with a million files must not become a multi-megabyte exec payload. A stat
+# that fails (dangling symlink, vanished file) reports size 0 instead of failing the listing.
 _LIST_FILES_SNIPPET = (
-    "import os,sys,json;p=sys.argv[1];"
-    "print(json.dumps([{'name':e.name,'path':os.path.join(p,e.name),"
-    "'is_dir':e.is_dir(),'size':(e.stat().st_size if e.is_file() else 0)} "
-    "for e in os.scandir(p)]))"
+    "import os,sys,json,itertools;p=sys.argv[1];n=int(sys.argv[2]);"
+    "es=list(itertools.islice(os.scandir(p),n+1))\n"
+    "def sz(e):\n"
+    "  try: return e.stat().st_size if e.is_file() else 0\n"
+    "  except OSError: return 0\n"
+    "print(json.dumps({'truncated':len(es)>n,'entries':[{'name':e.name,"
+    "'path':os.path.join(p,e.name),'is_dir':e.is_dir(),'size':sz(e)} for e in es[:n]]}))"
 )
 
 
@@ -93,9 +134,16 @@ class SessionOpsMixin:
 
     async def exec(self, session_id, command, *, timeout_seconds=60, workdir=None) -> ExecResult:
         full = f"cd {shlex.quote(workdir or WORKDIR)} && {command}"
+        seconds = max(1, int(timeout_seconds))
         start = time.monotonic()
-        rc, out, err = await self._exec_cli(session_id, "sh", "-c", full,
-                                            timeout=timeout_seconds + 2)
+        # The deadline is enforced INSIDE the session by GNU `timeout`, which signals the whole
+        # process group (TERM, then KILL a second later). Dropping the exec stream from our
+        # side does not kill anything: a `docker exec` client that goes away leaves the
+        # process running, and so does a kubelet exec without a TTY — the command would keep
+        # burning its CPU share until the session itself is reaped. Exit 124 = timed out,
+        # 137 = timed out and ignored TERM. Our own wait is only the backstop behind it.
+        rc, out, err = await self._exec_cli(session_id, "timeout", "-k", "1", str(seconds),
+                                            "sh", "-c", full, timeout=seconds + 2)
         dur_ms = int((time.monotonic() - start) * 1000)
         stdout, t1 = cap_output(out, self.max_output_bytes)
         stderr, t2 = cap_output(err, self.max_output_bytes)
@@ -128,12 +176,14 @@ class SessionOpsMixin:
         except UnicodeDecodeError:
             return base64.b64encode(out).decode(), "base64", truncated
 
-    async def list_files(self, session_id, path) -> list[FileEntry]:
-        rc, out, err = await self._exec_cli(session_id, "python3", "-c",
-                                            _LIST_FILES_SNIPPET, path, timeout=30)
+    async def list_files(self, session_id, path) -> tuple[list[FileEntry], bool]:
+        """Return ``(entries, truncated)`` — at most ``LIST_MAX_ENTRIES`` entries."""
+        rc, out, err = await self._exec_cli(session_id, "python3", "-c", _LIST_FILES_SNIPPET,
+                                            path, str(LIST_MAX_ENTRIES), timeout=30)
         if rc != 0:
             raise FileNotFoundError(err.decode(errors="replace").strip() or path)
-        return [FileEntry(**e) for e in json.loads(out.decode() or "[]")]
+        listing = json.loads(out.decode() or '{"truncated":false,"entries":[]}')
+        return [FileEntry(**e) for e in listing["entries"]], bool(listing["truncated"])
 
 
 @runtime_checkable
@@ -177,5 +227,6 @@ class SandboxProvider(Protocol):
         """Return ``(content, encoding, truncated)``."""
         ...
 
-    async def list_files(self, session_id: str, path: str) -> list[FileEntry]:
+    async def list_files(self, session_id: str, path: str) -> tuple[list[FileEntry], bool]:
+        """Return ``(entries, truncated)``."""
         ...

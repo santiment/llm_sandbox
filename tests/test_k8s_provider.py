@@ -296,15 +296,29 @@ async def test_exec_timeout_reports_the_conventional_code():
 
 
 async def test_list_files_parses_the_json_snippet():
-    entries = [{"name": "a.csv", "path": "/workspace/a.csv", "is_dir": False, "size": 12}]
+    listing = {"truncated": True, "entries": [
+        {"name": "a.csv", "path": "/workspace/a.csv", "is_dir": False, "size": 12}]}
 
     async def handler(ws):
-        await ws.send(bytes([CH_STDOUT]) + json.dumps(entries).encode())
+        await ws.send(bytes([CH_STDOUT]) + json.dumps(listing).encode())
         await ws.send(bytes([CH_ERROR]) + SUCCESS)
 
     async with exec_server(handler) as port:
-        out = await provider(FakeApi(ws_port=port)).list_files("s1", "/workspace")
-    assert (out[0].name, out[0].size, out[0].is_dir) == ("a.csv", 12, False)
+        out, truncated = await provider(FakeApi(ws_port=port)).list_files("s1", "/workspace")
+    assert (out[0].name, out[0].size, out[0].is_dir, truncated) == ("a.csv", 12, False, True)
+
+
+async def test_exec_runs_under_an_in_session_timeout():
+    """The deadline must be enforced inside the pod: dropping the stream kills nothing."""
+    seen = {}
+
+    async def handler(ws):
+        seen["url"] = ws.request.path
+        await ws.send(bytes([CH_ERROR]) + SUCCESS)
+
+    async with exec_server(handler) as port:
+        await provider(FakeApi(ws_port=port)).exec("s1", "true", timeout_seconds=7)
+    assert "command=timeout&command=-k&command=1&command=7&command=sh&command=-c" in seen["url"]
 
 
 async def test_read_file_falls_back_to_base64_for_binary():

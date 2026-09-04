@@ -32,6 +32,14 @@ A **session = one persistent workspace** (`/workspace`): files you write survive
 `exec`/`run` until you `DELETE` the session. `run` is composed on `write_file`+`exec`, so it
 behaves identically on every provider.
 
+`exec`/`run` deadlines are enforced **inside** the session by GNU `timeout` (the whole
+process group gets TERM, then KILL a second later), so a runaway command stops at
+`timeout_seconds` instead of burning its CPU share until the session is reaped. `exit_code`
+124 means it hit the deadline; 137 means it did so and ignored TERM. stdout/stderr are
+capped at `SANDBOX_MAX_OUTPUT_BYTES` **as they stream** (never buffered whole), and
+`files/list` returns at most 2000 entries with `truncated: true` beyond that. Any image in
+`SANDBOX_ALLOWED_IMAGES` must ship coreutils `timeout` and `python3` for these to work.
+
 ## Quickstart (local)
 
 **Easiest — docker compose:**

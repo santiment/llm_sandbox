@@ -396,6 +396,7 @@ async def read_file(sid: SessionId, path: Annotated[str, Query(min_length=1)],
 
 @app.get("/sessions/{sid}/files/list", response_model=ListFilesResponse, dependencies=[Depends(_auth)])
 async def list_files(sid: SessionId, path: Annotated[str, Query(min_length=1)] = "/workspace"):
-    entries = await provider.list_files(sid, path)
-    log.info("LIST     session=%s  path=%s  -> %d entries", sid, path, len(entries))
-    return ListFilesResponse(path=path, entries=entries)
+    entries, truncated = await provider.list_files(sid, path)
+    log.info("LIST     session=%s  path=%s  -> %d entries  truncated=%s", sid, path,
+             len(entries), truncated)
+    return ListFilesResponse(path=path, entries=entries, truncated=truncated)

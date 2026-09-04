@@ -73,6 +73,24 @@ async def test_exec_argv():
     p = provider()
     calls = stub(p)
     await p.exec("abc", "echo hi", timeout_seconds=5)
-    assert calls[0][:3] == ["exec", "llmsbx_abc", "sh"]
+    # GNU timeout inside the container is what actually stops the command at the deadline.
+    assert calls[0][:8] == ["exec", "llmsbx_abc", "timeout", "-k", "1", "5", "sh", "-c"]
+    assert calls[0][8].endswith("&& echo hi")
     await p.write_file("abc", "/workspace/f", "x")
     assert calls[1][:3] == ["exec", "-i", "llmsbx_abc"]          # stdin attached only when needed
+
+
+async def test_exec_output_is_capped_at_the_stream():
+    """The cap must be passed down to run_cli, where it bounds memory as bytes arrive —
+    not applied after the whole output has been buffered."""
+    p = provider(max_output_bytes=10)
+    seen = {}
+
+    async def _docker(*args, stdin=None, timeout=None, max_bytes=None, control=False):
+        seen["max_bytes"] = max_bytes
+        return 0, b"x" * max_bytes, b""
+
+    p._docker = _docker
+    r = await p.exec("abc", "yes", timeout_seconds=5)
+    assert seen["max_bytes"] == 11
+    assert (len(r.stdout), r.truncated) == (10, True)

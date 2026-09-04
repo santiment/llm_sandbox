@@ -48,7 +48,7 @@ class RunRequest(BaseModel):
 class ExecResult(BaseModel):
     stdout: str
     stderr: str
-    exit_code: int
+    exit_code: int                       # 124 = hit timeout_seconds; 137 = did so and ignored TERM
     truncated: bool = False              # output exceeded the byte cap and was trimmed
     duration_ms: Optional[int] = None
 
@@ -82,3 +82,4 @@ class FileEntry(BaseModel):
 class ListFilesResponse(BaseModel):
     path: str
     entries: list[FileEntry]
+    truncated: bool = False              # more entries exist than the listing cap returns
