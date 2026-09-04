@@ -212,7 +212,7 @@ class K8sProvider(SessionOpsMixin):
                  node_selector: str, toleration: str, create_timeout: int,
                  max_output_bytes: int, image_pull_secrets: str = "",
                  max_concurrency: int = 16, reap_interval: int = 120,
-                 allow_no_runtime_class: bool = False,
+                 allow_no_runtime_class: bool = False, disk_mb: int = 1024,
                  api: ApiServer | None = None) -> None:
         if not runtime_class and not allow_no_runtime_class:
             raise RuntimeError(
@@ -226,6 +226,7 @@ class K8sProvider(SessionOpsMixin):
         self.image_pull_secrets = parse_csv(image_pull_secrets)
         self.create_timeout = create_timeout
         self.max_output_bytes = max_output_bytes
+        self.disk_mb = disk_mb
         self.reap_interval = reap_interval
         self.api = api or ApiServer()
         self.namespace = namespace or self.api.default_namespace()
@@ -306,9 +307,21 @@ class K8sProvider(SessionOpsMixin):
                 "imagePullPolicy": "IfNotPresent",
                 "resources": {
                     # Low request = dense packing on the sandbox node; the limit is the
-                    # hard cap untrusted code can actually allocate.
-                    "requests": {"cpu": "100m", "memory": "64Mi"},
-                    "limits": {"cpu": str(cpus), "memory": f"{memory_mb}Mi"},
+                    # hard cap untrusted code can actually allocate. ephemeral-storage
+                    # bounds the writable layer: without it `dd if=/dev/zero` fills the
+                    # node's disk and evicts every other pod on it.
+                    "requests": {"cpu": "100m", "memory": "64Mi", "ephemeral-storage": "64Mi"},
+                    "limits": {"cpu": str(cpus), "memory": f"{memory_mb}Mi",
+                               "ephemeral-storage": f"{self.disk_mb}Mi"},
+                },
+                # root inside the sandbox by design (gVisor is the boundary, not the uid) —
+                # but a root with no capabilities and no way to acquire any. Agent code writes
+                # files; it does not chown, mount or open raw sockets. RuntimeDefault seccomp
+                # is honoured by runc and harmlessly superseded by gVisor's own filtering.
+                "securityContext": {
+                    "allowPrivilegeEscalation": False,
+                    "capabilities": {"drop": ["ALL"]},
+                    "seccompProfile": {"type": "RuntimeDefault"},
                 },
             }],
         }

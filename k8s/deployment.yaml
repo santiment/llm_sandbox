@@ -76,6 +76,10 @@ spec:
               value: "4096"
             - name: SANDBOX_MAX_CPUS
               value: "2"
+            # Writable disk per session (ephemeral-storage limit). Keep under the LimitRange
+            # max in k8s/quota.yaml.
+            - name: SANDBOX_DISK_MB
+              value: "1024"
             - name: SANDBOX_MAX_CONCURRENCY
               value: "32"
             # Live sessions PER REPLICA — 2 replicas × 24 = 48 session pods, which with the

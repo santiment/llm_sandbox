@@ -135,7 +135,11 @@ kubectl -n llm-sandbox create secret generic llm-sandbox \
 kubectl apply -f k8s/rbac.yaml   -f k8s/networkpolicy.yaml -f k8s/quota.yaml \
               -f k8s/pdb.yaml    -f k8s/service.yaml       -f k8s/deployment.yaml
 
-# 5. Optional: kubectl apply -f k8s/hpa.yaml                        # CPU autoscale 2→6
+# 5. Recommended: kubectl apply -f k8s/admission-session-pods.yaml
+#    A ValidatingAdmissionPolicy that makes the apiserver itself refuse any pod the service's
+#    ServiceAccount creates without runtimeClassName: gvisor / no SA token / disk+memory
+#    limits — the guarantee that holds even if the service is compromised.
+# 6. Optional: kubectl apply -f k8s/hpa.yaml                        # CPU autoscale 2→6
 #              kubectl apply -f k8s/networkpolicy-client-ingress.yaml
 #    The latter restricts who may CALL the service to namespaces labelled
 #    llm-sandbox/client=true — it will cut off unlabelled callers, so label them first.
@@ -165,6 +169,13 @@ Operational notes:
   pods) — **raise both together**, or creates will start failing at the admission layer.
 - **Pids:** unlike docker's `--pids-limit`, per-pod pid caps come from the kubelet
   (`podPidsLimit`) on the sandbox nodes.
+- **Disk:** every session pod carries an `ephemeral-storage` limit (`SANDBOX_DISK_MB`), so a
+  runaway write fills its own budget, not the node. The kubelet enforces it by eviction, so
+  expect a session that blows through it to die rather than to get `ENOSPC`.
+- **Session pod posture:** every capability dropped, `allowPrivilegeEscalation: false`,
+  `RuntimeDefault` seccomp, no SA token, no service links — on top of gVisor. Root inside the
+  sandbox is deliberate (files land anywhere), but it is a root that can do nothing to the
+  node even if gVisor were somehow bypassed.
 - **Probes:** `/healthz` (liveness) is shallow on purpose; `/readyz` (readiness) checks the
   apiserver and the RBAC, so a missing Role drains the pod from the Service instead of
   restart-looping it. A failed preflight is visible in the `/readyz` body.
@@ -226,7 +237,9 @@ gVisor (`runsc`) is the security boundary for untrusted LLM-written code.
   caller names would be pulled with the service's registry credentials and run on the
   sandbox nodes.
 - On k8s: session pods mount no ServiceAccount token and the service's RBAC is
-  namespace-scoped.
+  namespace-scoped; `k8s/admission-session-pods.yaml` makes the apiserver refuse a session
+  pod without gVisor even if the service itself is compromised.
+- Per-session writable disk is capped (`SANDBOX_DISK_MB`, k8s only).
 
 ## Repo layout
 
@@ -242,6 +255,7 @@ src/llm_sandbox/
 Dockerfile            SERVICE image (alpine, multi-stage; targets: prod, dev)
 sandbox.Dockerfile    RUNTIME image — what untrusted code executes in (debian slim)
 k8s/                  manifests; k8s/examples/ is reference-only, never `kubectl apply -f k8s/`
+                      admission-session-pods.yaml: cluster-side gVisor guarantee (recommended)
 tests/                pytest; no cluster, daemon, or network required
 run.sh                dev bring-up, isolation doctor/verify, smoke check, cleanup
 ```
@@ -262,6 +276,7 @@ are set in `k8s/deployment.yaml`, not in a `.env`.
 | `SANDBOX_MAX_OUTPUT_BYTES` | `1000000` | Cap on any stdout/stderr/file payload returned |
 | `SANDBOX_MAX_MEMORY_MB` | `4096` | Ceiling on a caller's `memory_mb` (clamped, not rejected) |
 | `SANDBOX_MAX_CPUS` | `2` | Ceiling on a caller's `cpus` (clamped, not rejected) |
+| `SANDBOX_DISK_MB` | `1024` | Writable disk per session (k8s `ephemeral-storage` limit; not enforced under docker) |
 | `SANDBOX_MAX_CONCURRENCY` | `32` | In-flight backend ops across all sessions |
 | `SANDBOX_MAX_SESSION_SECONDS` | `3600` | Ceiling on a session's `timeout_seconds` (clamped) |
 | `SANDBOX_MAX_EXEC_SECONDS` | `600` | Ceiling on an exec/run `timeout_seconds` (clamped) |

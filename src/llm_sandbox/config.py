@@ -50,6 +50,7 @@ class Config:
     max_output_bytes: int    # hard cap on any single stdout/stderr/file payload
     max_memory_mb: int       # ceiling on a caller's per-session memory_mb
     max_cpus: float          # ceiling on a caller's per-session cpus
+    disk_mb: int             # per-session writable-disk cap (k8s ephemeral-storage limit)
     max_concurrency: int     # in-flight backend operations across all sessions
     max_session_seconds: int # ceiling on a caller's session timeout_seconds (clamped)
     max_exec_seconds: int    # ceiling on a caller's exec/run timeout_seconds (clamped)
@@ -84,6 +85,7 @@ class Config:
             max_output_bytes=_int("SANDBOX_MAX_OUTPUT_BYTES", 1_000_000),
             max_memory_mb=_int("SANDBOX_MAX_MEMORY_MB", 4096),
             max_cpus=float(_env("SANDBOX_MAX_CPUS", "2") or 2),
+            disk_mb=_int("SANDBOX_DISK_MB", 1024),
             max_concurrency=_int("SANDBOX_MAX_CONCURRENCY", 32),
             max_session_seconds=_int("SANDBOX_MAX_SESSION_SECONDS", 3600),
             max_exec_seconds=_int("SANDBOX_MAX_EXEC_SECONDS", 600),

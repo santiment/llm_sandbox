@@ -159,7 +159,19 @@ def test_manifest_security_and_placement():
     # `sleep` as a non-reaping PID 1.
     assert container["args"] == ["sleep", "900"]
     assert "command" not in container
-    assert container["resources"]["limits"] == {"cpu": "1.0", "memory": "512Mi"}
+    assert container["resources"]["limits"] == {"cpu": "1.0", "memory": "512Mi",
+                                                "ephemeral-storage": "1024Mi"}
+    assert container["securityContext"] == {
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+
+
+def test_manifest_disk_cap_is_configurable():
+    p = provider(FakeApi(), disk_mb=256)
+    spec = p._manifest("n", "i", 60, network=False, memory_mb=64, cpus=1.0)["spec"]
+    assert spec["containers"][0]["resources"]["limits"]["ephemeral-storage"] == "256Mi"
 
 
 def test_manifest_network_label_gates_the_egress_policy():
