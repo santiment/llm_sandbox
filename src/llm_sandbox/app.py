@@ -291,8 +291,24 @@ async def readyz():
     return {"ok": True, "provider": provider.name}
 
 
+def _resolve_image(requested: str | None) -> str:
+    """The `image` field is public API and lands in a pod spec / docker argv, so it is an
+    allowlist, not a free string: any pullable ref would otherwise run under our registry
+    credentials (image pull secrets, the daemon's ECR login) — i.e. a token holder could pull
+    and read any private image, or pull anything at all onto the sandbox nodes."""
+    if requested is None or requested == cfg.default_image:
+        return cfg.default_image
+    if requested in cfg.allowed_images:
+        return requested
+    raise HTTPException(
+        status_code=400,
+        detail=f"image {requested!r} is not allowed — the default image is {cfg.default_image!r}; "
+               "other images must be listed in SANDBOX_ALLOWED_IMAGES")
+
+
 @app.post("/sessions", response_model=Session, dependencies=[Depends(_auth)])
 async def create_session(req: CreateSessionRequest):
+    image = _resolve_image(req.image)
     # memory_mb/cpus are caller-supplied, so clamp before they reach the scheduler.
     memory_mb, cpus = clamp_resources(req.memory_mb, req.cpus,
                                       max_memory_mb=cfg.max_memory_mb, max_cpus=cfg.max_cpus)
@@ -301,14 +317,14 @@ async def create_session(req: CreateSessionRequest):
     # Count is capped too, not just per-session size (SANDBOX_MAX_SESSIONS).
     await slots.acquire()
     try:
-        sid = await provider.create(image=req.image, timeout_seconds=timeout_seconds,
+        sid = await provider.create(image=image, timeout_seconds=timeout_seconds,
                                     network=req.network, memory_mb=memory_mb, cpus=cpus)
     except BaseException:  # includes CancelledError — a dropped client must free the slot
         slots.rollback()
         raise
     slots.commit(sid, timeout_seconds)
-    log.info("CREATE   session=%s  provider=%s  network=%s  mem=%sMi  cpus=%s",
-             sid, provider.name, req.network, memory_mb, cpus)
+    log.info("CREATE   session=%s  provider=%s  image=%s  network=%s  mem=%sMi  cpus=%s",
+             sid, provider.name, image, req.network, memory_mb, cpus)
     return Session(session_id=sid, provider=provider.name)
 
 

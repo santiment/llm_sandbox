@@ -13,6 +13,7 @@ def build_provider(cfg: Config) -> SandboxProvider:
         return GvisorProvider(
             default_image=cfg.default_image,
             docker_runtime=cfg.docker_runtime,
+            docker_network=cfg.docker_network,
             max_output_bytes=cfg.max_output_bytes,
             max_concurrency=cfg.max_concurrency,
         )

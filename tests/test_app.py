@@ -182,3 +182,24 @@ def test_session_cap_returns_429_and_delete_frees_a_slot(client):
     assert r.headers["Retry-After"] == "5"
     assert client.delete(f"/sessions/{a}", headers=AUTH).status_code == 200
     create(client)
+
+
+# --- image allowlist ------------------------------------------------------------------------
+
+def test_image_override_is_an_allowlist(client, monkeypatch):
+    monkeypatch.setattr(appmod.cfg, "allowed_images", ["registry/extra:1"])
+    create(client, {"image": appmod.cfg.default_image})
+    assert client.fake.last("create")["image"] == appmod.cfg.default_image
+    create(client, {"image": "registry/extra:1"})
+    assert client.fake.last("create")["image"] == "registry/extra:1"
+    r = client.post("/sessions", json={"image": "evil/thing:latest"}, headers=AUTH)
+    assert r.status_code == 400
+    assert "SANDBOX_ALLOWED_IMAGES" in r.json()["detail"]
+    r = client.post("/sessions", json={"image": "--privileged"}, headers=AUTH)
+    assert r.status_code == 400
+    assert len([c for c in client.fake.calls if c[0] == "create"]) == 2
+
+
+def test_no_image_means_the_default(client):
+    create(client)
+    assert client.fake.last("create")["image"] == appmod.cfg.default_image

@@ -26,9 +26,13 @@ class GvisorProvider(SessionOpsMixin):
     name = "gvisor"
 
     def __init__(self, *, default_image: str, docker_runtime: str, max_output_bytes: int,
-                 max_concurrency: int = 16) -> None:
+                 max_concurrency: int = 16, docker_network: str = "bridge") -> None:
         self.default_image = default_image
         self.docker_runtime = docker_runtime
+        # The network a network=true session joins. The daemon's default `bridge` lets sessions
+        # reach each other, the host's LAN and (on EC2) the metadata service — see README for
+        # the hardened network this should point at in anything but local dev.
+        self.docker_network = docker_network
         self.max_output_bytes = max_output_bytes
         # This provider really does fork a `docker` binary per call, so the cap here is a
         # memory guard, not just a politeness limit.
@@ -86,10 +90,20 @@ class GvisorProvider(SessionOpsMixin):
         args = [
             "run", "-d", "--rm", "--name", name,
             "--runtime", self.docker_runtime,
-            "--network", "bridge" if network else "none",
-            "--memory", f"{memory_mb}m", "--cpus", str(cpus),
+            "--network", self.docker_network if network else "none",
+            # --memory alone still allows as much swap again on a host that has swap; pinning
+            # memory-swap to the same value makes the cap a cap.
+            "--memory", f"{memory_mb}m", "--memory-swap", f"{memory_mb}m",
+            "--cpus", str(cpus),
             "--pids-limit", "256",
+            # root inside, but a root with no capabilities and no way to gain any: agent code
+            # writes files, it does not chown/mount/raw-socket. Cheap under runc, and gVisor
+            # honours both in its own kernel.
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--workdir", WORKDIR,
+            # `--` ends flag parsing: `image` is caller-influenced (allowlisted upstream, but
+            # belt and braces) and a value like `--privileged` must never be read as a flag.
+            "--",
             image or self.default_image,
             "sleep", str(int(timeout_seconds)),
         ]

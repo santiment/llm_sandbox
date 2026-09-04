@@ -44,7 +44,9 @@ class Config:
     provider: str            # "gvisor" (docker, local) | "k8s" (pod-per-session on Kubernetes)
     auth_token: str          # shared bearer; callers send `Authorization: Bearer <token>`. Empty = auth off (dev only).
     default_image: str       # sandbox runtime image (built from sandbox.Dockerfile)
+    allowed_images: list[str]  # images a caller may pick via `image`; default_image is always allowed
     docker_runtime: str      # "runsc" (gVisor, prod) | "runc" (standard, dev only — NOT isolated)
+    docker_network: str      # docker network for network=true sessions ("bridge" = daemon default)
     max_output_bytes: int    # hard cap on any single stdout/stderr/file payload
     max_memory_mb: int       # ceiling on a caller's per-session memory_mb
     max_cpus: float          # ceiling on a caller's per-session cpus
@@ -76,7 +78,9 @@ class Config:
             provider=_env("SANDBOX_PROVIDER", "gvisor").strip().lower(),
             auth_token=_env("LLM_SANDBOX_TOKEN"),
             default_image=_env("SANDBOX_IMAGE", "llm-sandbox-runtime:latest"),
+            allowed_images=[s.strip() for s in _env("SANDBOX_ALLOWED_IMAGES").split(",") if s.strip()],
             docker_runtime=_env("SANDBOX_DOCKER_RUNTIME", "runsc"),
+            docker_network=_env("SANDBOX_DOCKER_NETWORK", "bridge"),
             max_output_bytes=_int("SANDBOX_MAX_OUTPUT_BYTES", 1_000_000),
             max_memory_mb=_int("SANDBOX_MAX_MEMORY_MB", 4096),
             max_cpus=float(_env("SANDBOX_MAX_CPUS", "2") or 2),

@@ -178,7 +178,24 @@ gVisor (`runsc`) is the security boundary for untrusted LLM-written code.
 - **Kubernetes (prod):** the cluster provides it — RuntimeClass `gvisor` on the dedicated
   node group; the k8s provider sets `runtimeClassName` on every session pod.
 - **Docker on Linux (local/EC2):** install `runsc`, register it as a Docker runtime, keep
-  `SANDBOX_DOCKER_RUNTIME=runsc`.
+  `SANDBOX_DOCKER_RUNTIME=runsc`. Sessions run with every capability dropped,
+  `no-new-privileges`, swap pinned to the memory cap and a pids cap. **`network:true` is
+  the one thing docker does not fence for you**: on the default `bridge` a session can reach
+  other sessions, the host's LAN and, on EC2, the instance metadata service (= the node's
+  IAM credentials). The k8s NetworkPolicy blocks all of that; under docker you build the
+  equivalent once and point `SANDBOX_DOCKER_NETWORK` at it:
+
+  ```bash
+  docker network create --opt com.docker.network.bridge.enable_icc=false llmsbx-net
+  SUBNET=$(docker network inspect llmsbx-net -f '{{(index .IPAM.Config 0).Subnet}}')
+  for cidr in 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+    iptables -I DOCKER-USER -s "$SUBNET" -d "$cidr" -j DROP     # metadata + private ranges
+  done
+  echo 'SANDBOX_DOCKER_NETWORK=llmsbx-net' >> .env
+  # and on EC2, independently: IMDSv2 only, hop limit 1 (containers are one hop too far)
+  aws ec2 modify-instance-metadata-options --instance-id "$ID" \
+      --http-tokens required --http-put-response-hop-limit 1
+  ```
 - **Dev on macOS:** Docker Desktop **cannot** host `runsc` — its LinuxKit VM ships no `runsc`
   binary and offers no durable way to add one. Two honest options:
   - *Plumbing only:* `SANDBOX_DOCKER_RUNTIME=runc`. Everything works and nothing is isolated.
@@ -205,6 +222,9 @@ gVisor (`runsc`) is the security boundary for untrusted LLM-written code.
 - Ephemeral: a session is one container/pod, destroyed on `DELETE` or auto-reaped after
   `timeout_seconds`. Never reuse a session across users/tasks.
 - Bearer auth (`LLM_SANDBOX_TOKEN`) between callers and the service.
+- The `image` field is an allowlist (`SANDBOX_ALLOWED_IMAGES`), not a free string: whatever a
+  caller names would be pulled with the service's registry credentials and run on the
+  sandbox nodes.
 - On k8s: session pods mount no ServiceAccount token and the service's RBAC is
   namespace-scoped.
 
@@ -236,7 +256,9 @@ are set in `k8s/deployment.yaml`, not in a `.env`.
 | `SANDBOX_PROVIDER` | `gvisor` | `gvisor` (docker) or `k8s` (pod-per-session) |
 | `LLM_SANDBOX_TOKEN` | — | Bearer token callers must send. **Empty disables auth — dev only** |
 | `SANDBOX_IMAGE` | `llm-sandbox-runtime:latest` | Runtime image. On k8s: registry ref, immutable tag |
+| `SANDBOX_ALLOWED_IMAGES` | — | Extra images a caller may pick via `image` (`a,b`). Default image always allowed; anything else → 400 |
 | `SANDBOX_DOCKER_RUNTIME` | `runsc` | gvisor provider only. `runc` = no isolation, dev only |
+| `SANDBOX_DOCKER_NETWORK` | `bridge` | gvisor provider only. Network for `network:true` sessions — see [Docker on Linux](#gvisor--runsc) |
 | `SANDBOX_MAX_OUTPUT_BYTES` | `1000000` | Cap on any stdout/stderr/file payload returned |
 | `SANDBOX_MAX_MEMORY_MB` | `4096` | Ceiling on a caller's `memory_mb` (clamped, not rejected) |
 | `SANDBOX_MAX_CPUS` | `2` | Ceiling on a caller's `cpus` (clamped, not rejected) |
