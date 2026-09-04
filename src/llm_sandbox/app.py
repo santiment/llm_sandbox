@@ -23,7 +23,7 @@ from .config import Config
 from .models import (CreateSessionRequest, ExecRequest, ExecResult, ListFilesResponse,
                      ReadFileResponse, RunRequest, Session, WriteFileRequest)
 from .providers import build_provider
-from .providers.base import clamp_resources
+from .providers.base import PathNotFound, SessionNotFound, clamp_resources
 
 # Preview caps — how much of a command/script body lands in the log. Scripts often live inside
 # an EXEC heredoc (`cat << EOF > file.py …`), so the cmd cap is generous: the log is the audit
@@ -274,6 +274,25 @@ class BodyLimitMiddleware:
 app.add_middleware(BodyLimitMiddleware, limit=cfg.max_request_bytes)
 
 
+@app.exception_handler(SessionNotFound)
+async def _session_not_found(_request, exc: SessionNotFound) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": f"no such session: {exc}"})
+
+
+@app.exception_handler(PathNotFound)
+async def _path_not_found(_request, exc: PathNotFound) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(RuntimeError)
+async def _backend_failure(_request, exc: RuntimeError) -> JSONResponse:
+    """Provider failures (daemon/apiserver said no, pod never got ready, write failed) are
+    502s with the provider's own hint — which names the fix — rather than an anonymous 500
+    whose only trace is a stack in the pod log."""
+    log.error("BACKEND  %s", exc)
+    return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+
 @app.exception_handler(RequestValidationError)
 async def _validation_error(_request, exc: RequestValidationError) -> JSONResponse:
     """FastAPI's default 422 echoes ``input`` — the whole offending payload (megabytes of file
@@ -367,8 +386,8 @@ async def destroy_session(sid: SessionId):
 @app.post("/sessions/{sid}/exec", response_model=ExecResult, dependencies=[Depends(_auth)])
 async def exec_command(sid: SessionId, req: ExecRequest):
     """Run a shell command (awk/sed/bash/anything) — the universal file-manipulation primitive."""
-    log.info("EXEC     session=%s  cmd (%s):\n%s", sid, _metrics(req.command),
-             _block(req.command, _CMD_PREVIEW))
+    log.info("EXEC     session=%s  workdir=%r  cmd (%s):\n%s", sid, req.workdir,
+             _metrics(req.command), _block(req.command, _CMD_PREVIEW))
     # Bounded: an exec holds a backend slot (SANDBOX_MAX_CONCURRENCY) for its whole duration.
     timeout_seconds = min(req.timeout_seconds, cfg.max_exec_seconds)
     r = await provider.exec(sid, req.command, timeout_seconds=timeout_seconds,
@@ -399,7 +418,7 @@ async def run_code(sid: SessionId, req: RunRequest):
 @app.put("/sessions/{sid}/files", dependencies=[Depends(_auth)])
 async def write_file(sid: SessionId, req: WriteFileRequest):
     await provider.write_file(sid, req.path, req.content, encoding=req.encoding)
-    log.info("WRITE    session=%s  path=%s  [%s]  enc=%s", sid, req.path,
+    log.info("WRITE    session=%s  path=%r  [%s]  enc=%s", sid, req.path,
              _payload_metrics(req.content, req.encoding), req.encoding)
     return {"ok": True}
 
@@ -410,7 +429,7 @@ async def read_file(sid: SessionId, path: Annotated[str, Query(min_length=1)],
     # ge=1 matters: a negative value reaches `head -c` as "all but the last N bytes", which
     # would return the whole file and defeat the output cap.
     content, encoding, truncated = await provider.read_file(sid, path, max_bytes=max_bytes)
-    log.info("READ     session=%s  path=%s  [%s]  enc=%s  truncated=%s", sid, path,
+    log.info("READ     session=%s  path=%r  [%s]  enc=%s  truncated=%s", sid, path,
              _payload_metrics(content, encoding), encoding, truncated)
     return ReadFileResponse(path=path, content=content, encoding=encoding, truncated=truncated)
 
@@ -418,6 +437,6 @@ async def read_file(sid: SessionId, path: Annotated[str, Query(min_length=1)],
 @app.get("/sessions/{sid}/files/list", response_model=ListFilesResponse, dependencies=[Depends(_auth)])
 async def list_files(sid: SessionId, path: Annotated[str, Query(min_length=1)] = "/workspace"):
     entries, truncated = await provider.list_files(sid, path)
-    log.info("LIST     session=%s  path=%s  -> %d entries  truncated=%s", sid, path,
+    log.info("LIST     session=%s  path=%r  -> %d entries  truncated=%s", sid, path,
              len(entries), truncated)
     return ListFilesResponse(path=path, entries=entries, truncated=truncated)

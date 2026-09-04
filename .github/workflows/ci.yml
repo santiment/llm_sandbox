@@ -5,17 +5,30 @@ on:
     branches: [main]
   pull_request:
 
+# The default GITHUB_TOKEN can write to the repo; this workflow only needs to read it.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      # Actions pinned to a commit SHA, not a tag: a tag can be moved to different code by
+      # anyone who controls (or compromises) the upstream repo. The trailing comment is the
+      # version that SHA was taken from — bump both together.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           python-version: "3.11"
       # The lock must match pyproject (incl. the exclude-newer freshness window) —
       # a drifted lock fails here instead of resolving differently per machine.
       - run: uv lock --check
+      # Same freshness window for the runtime image's deps: a drifted sandbox-requirements.txt
+      # fails here instead of quietly building a different image.
+      - run: uv pip compile --quiet --no-header --generate-hashes --python-platform linux --python-version 3.11
+             --exclude-newer "$(sed -n 's/^exclude-newer = "\(.*\)"/\1/p' pyproject.toml)"
+             sandbox-requirements.in -o /tmp/sandbox-requirements.txt
+             && diff -u sandbox-requirements.txt /tmp/sandbox-requirements.txt
       # dev is a dependency-group (installed by `uv sync` by default), not an extra.
       - run: uv sync
       - run: uv run pytest -q

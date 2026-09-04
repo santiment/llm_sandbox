@@ -28,6 +28,10 @@ the isolation backend is a server-side env change — callers don't change.
 The sandbox is **python-only by design** (python3 + pandas/numpy preinstalled + the shell
 toolchain); there is no node runtime in the image.
 
+Status codes: `401` bad/missing token · `400` image not allowlisted · `404` no such session
+or path · `413` body over `SANDBOX_MAX_REQUEST_BYTES` · `422` malformed field · `429` session
+cap (with `Retry-After`) · `502` the backend refused (the `detail` names the fix).
+
 A **session = one persistent workspace** (`/workspace`): files you write survive across
 `exec`/`run` until you `DELETE` the session. `run` is composed on `write_file`+`exec`, so it
 behaves identically on every provider.
@@ -266,6 +270,7 @@ src/llm_sandbox/
     k8s.py            one gVisor pod per session, direct kube-apiserver calls
 Dockerfile            SERVICE image (alpine, multi-stage; targets: prod, dev)
 sandbox.Dockerfile    RUNTIME image — what untrusted code executes in (debian slim)
+sandbox-requirements  .in = what the runtime image needs; .txt = pinned + hashed (uv pip compile)
 k8s/                  manifests; k8s/examples/ is reference-only, never `kubectl apply -f k8s/`
                       admission-session-pods.yaml: cluster-side gVisor guarantee (recommended)
 tests/                pytest; no cluster, daemon, or network required
@@ -329,11 +334,17 @@ a single "run this argv in the session" hook, so file semantics can't drift betw
 uv sync && uv run pytest        # no cluster, no daemon, no network
 ```
 
-`tests/test_k8s_provider.py` covers the k8s provider against local fakes: the REST verbs
-against a scripted apiserver, and `exec` against a real local WebSocket server that speaks
-the actual `v5.channel.k8s.io` framing (channel-prefixed frames, the stdin close frame, the
-`Status` carrying the exit code). Those tests exist because that transport replaced
-`kubectl exec` and a live cluster is the only other place it runs.
+- `tests/test_app.py` — the HTTP layer against a fake provider: auth, every bound on
+  caller-supplied input, the image allowlist, status mapping, slot accounting and resync.
+- `tests/test_base.py` — the shared plumbing with real local subprocesses: the streaming
+  output cap, stdin feeding, kill-on-timeout, the in-session `timeout` wrapper, `run`.
+- `tests/test_gvisor_provider.py` — the exact `docker run`/`docker exec` argv (the security
+  posture of that provider *is* its argv), against a stubbed CLI.
+- `tests/test_k8s_provider.py` — the REST verbs against a scripted apiserver, and `exec`
+  against a real local WebSocket server that speaks the actual `v5.channel.k8s.io` framing
+  (channel-prefixed frames, the stdin close frame, the `Status` carrying the exit code).
+  Those exist because that transport replaced `kubectl exec` and a live cluster is the only
+  other place it runs.
 
 ## Client integration
 

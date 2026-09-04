@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pytest
 
+from llm_sandbox.providers.base import SessionNotFound
 from llm_sandbox.providers.gvisor import GvisorProvider
 
 
@@ -102,3 +103,13 @@ async def test_live_session_ids_strips_the_prefix_and_tolerates_a_dead_daemon():
     assert await p.live_session_ids() == {"aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"}
     stub(p, rc=1, err=b"Cannot connect to the Docker daemon")
     assert await p.live_session_ids() is None
+
+
+async def test_exec_on_a_missing_session_is_not_a_successful_exec():
+    p = provider()
+    stub(p, rc=1, err=b"Error response from daemon: No such container: llmsbx_abc")
+    with pytest.raises(SessionNotFound):
+        await p.exec("abc", "true", timeout_seconds=5)
+    stub(p, rc=1, err=b"Error response from daemon: container abc is not running")
+    with pytest.raises(SessionNotFound):
+        await p.read_file("abc", "/f", max_bytes=10)

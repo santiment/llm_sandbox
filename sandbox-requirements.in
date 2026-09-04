@@ -1,0 +1,6 @@
+# What the sandbox RUNTIME image (sandbox.Dockerfile) preinstalls. sandbox-requirements.txt
+# is compiled from this with versions + hashes for every distribution of each pin — see
+# ./update_safe_deps_date.sh --lock (CI fails on drift).
+pandas
+numpy
+openpyxl

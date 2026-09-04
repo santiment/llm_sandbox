@@ -15,7 +15,7 @@ import json
 import logging
 import uuid
 
-from .base import WORKDIR, SessionOpsMixin, run_cli
+from .base import WORKDIR, SessionNotFound, SessionOpsMixin, run_cli
 
 log = logging.getLogger("llm_sandbox.gvisor")
 
@@ -82,9 +82,14 @@ class GvisorProvider(SessionOpsMixin):
     async def _exec_cli(self, session_id, *cmd, stdin=None, timeout=None):
         interactive = ("-i",) if stdin is not None else ()
         # +1 so SessionOpsMixin can still tell "exactly at the cap" from "over it".
-        return await self._docker("exec", *interactive, self._container(session_id), *cmd,
-                                  stdin=stdin, timeout=timeout,
-                                  max_bytes=self.max_output_bytes + 1)
+        rc, out, err = await self._docker("exec", *interactive, self._container(session_id),
+                                          *cmd, stdin=stdin, timeout=timeout,
+                                          max_bytes=self.max_output_bytes + 1)
+        # Otherwise the daemon's complaint would come back as a "successful" ExecResult with
+        # exit_code 1 and the error text in stderr — a 200 for a session that does not exist.
+        if rc != 0 and (b"No such container" in err or b"is not running" in err):
+            raise SessionNotFound(session_id)
+        return rc, out, err
 
     async def create(self, *, image=None, timeout_seconds=900, network=False,
                      memory_mb=512, cpus=1.0) -> str:

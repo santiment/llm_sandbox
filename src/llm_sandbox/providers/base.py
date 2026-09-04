@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import posixpath
 import shlex
 import time
 import uuid
@@ -28,6 +29,16 @@ TIMEOUT_EXIT = 124  # conventional "timed out" exit code (GNU timeout's, too)
 KILLED_EXIT = 137   # 128+SIGKILL: GNU timeout's code when the command ignored TERM
 LIST_MAX_ENTRIES = 2000  # list_files returns at most this many entries (+ truncated flag)
 _READ_CHUNK = 64 * 1024
+
+
+class SessionNotFound(LookupError):
+    """No container/pod for this session id (never created, already destroyed, or reaped).
+    The HTTP layer maps it to 404."""
+
+
+class PathNotFound(FileNotFoundError):
+    """The path does not exist inside the session. Mapped to 404 by the HTTP layer; a
+    subclass of FileNotFoundError so callers of the provider API keep their idiom."""
 
 
 def clamp_resources(memory_mb: int, cpus: float, *, max_memory_mb: int,
@@ -178,7 +189,9 @@ class SessionOpsMixin:
                           truncated=t1 or t2, duration_ms=dur_ms)
 
     async def write_file(self, session_id, path, content, *, encoding="utf-8") -> None:
-        parent = path.rsplit("/", 1)[0] if "/" in path else WORKDIR
+        # posixpath, not rsplit: for "/foo" the latter gave "" and `mkdir -p ''` failed the
+        # whole write. dirname("/foo") is "/", dirname("data.csv") is "" → cwd (/workspace).
+        parent = posixpath.dirname(path) or WORKDIR
         # One round-trip: ensure the parent dir, then stream stdin into the file. `mkdir` does
         # not touch stdin, so the redirect below still consumes the piped content.
         sink = "base64 -d" if encoding == "base64" else "cat"
@@ -195,7 +208,7 @@ class SessionOpsMixin:
         rc, out, err = await self._exec_cli(
             session_id, "sh", "-c", f"head -c {limit + 1} {shlex.quote(path)}", timeout=30)
         if rc != 0:
-            raise FileNotFoundError(err.decode(errors="replace").strip() or path)
+            raise PathNotFound(err.decode(errors="replace").strip() or path)
         truncated = len(out) > limit
         out = out[:limit]
         try:
@@ -208,7 +221,7 @@ class SessionOpsMixin:
         rc, out, err = await self._exec_cli(session_id, "python3", "-c", _LIST_FILES_SNIPPET,
                                             path, str(LIST_MAX_ENTRIES), timeout=30)
         if rc != 0:
-            raise FileNotFoundError(err.decode(errors="replace").strip() or path)
+            raise PathNotFound(err.decode(errors="replace").strip() or path)
         listing = json.loads(out.decode() or '{"truncated":false,"entries":[]}')
         return [FileEntry(**e) for e in listing["entries"]], bool(listing["truncated"])
 

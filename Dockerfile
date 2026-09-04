@@ -16,8 +16,9 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 # uv from PyPI (musl wheel); the ghcr.io/astral-sh/uv binary is glibc-linked and will not
-# execute on Alpine.
-RUN pip install --no-cache-dir uv
+# execute on Alpine. Pinned: the resolver that reads uv.lock is itself part of the build's
+# reproducibility (and of its supply chain). Bump deliberately, alongside uv.lock.
+RUN pip install --no-cache-dir uv==0.12.5
 
 WORKDIR /app
 # Dependencies from the lockfile (uv), project last — keeps the dep layer cache-stable.

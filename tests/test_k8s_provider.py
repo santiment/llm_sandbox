@@ -21,6 +21,7 @@ from urllib.parse import urlencode
 import pytest
 from websockets.asyncio.server import serve
 
+from llm_sandbox.providers.base import SessionNotFound
 from llm_sandbox.providers.k8s import (K8sProvider, _exit_code_from_status, parse_csv,
                                        parse_node_selector, parse_toleration)
 
@@ -326,6 +327,22 @@ async def test_exec_timeout_reports_the_conventional_code():
         r = await provider(FakeApi(ws_port=port)).exec("s1", "sleep 99", timeout_seconds=0)
     assert r.exit_code == 124
     assert "timed out" in r.stderr
+
+
+async def test_exec_on_a_missing_pod_is_session_not_found():
+    """The apiserver refuses the upgrade with a 404 before any stream opens."""
+    from websockets.http11 import Response
+
+    def refuse(connection, request):
+        return connection.respond(404, "pods \"llmsbx-s1\" not found")
+
+    async def handler(ws):
+        pass
+
+    async with serve(handler, "127.0.0.1", 0, process_request=refuse) as server:
+        port = server.sockets[0].getsockname()[1]
+        with pytest.raises(SessionNotFound):
+            await provider(FakeApi(ws_port=port)).exec("s1", "true", timeout_seconds=5)
 
 
 async def test_list_files_parses_the_json_snippet():

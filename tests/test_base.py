@@ -78,3 +78,15 @@ async def test_run_script_is_one_exec_with_the_code_on_stdin():
     assert script.endswith("; rc=$?; rm -f " + script.split("cat > ")[1].split(" ")[0] + "; exit $rc")
     assert stdin == b"print(1)"
     assert timeout == 14
+
+
+async def test_write_file_creates_the_right_parent_for_every_path_shape():
+    """`"/foo".rsplit("/", 1)[0]` is "" — `mkdir -p ''` failed every root-level write."""
+    r = Recorder()
+    for path, parent in [("/foo", "/"), ("/workspace/f.txt", "/workspace"),
+                         ("data.csv", "/workspace"), ("sub/x.csv", "sub"), ("/a/b/c", "/a/b")]:
+        r.calls.clear()
+        await r.write_file("s", path, "x")
+        cmd, stdin, _t = r.calls[0]
+        assert cmd[2].startswith(f"mkdir -p {parent} && cat > "), (path, cmd[2])
+        assert stdin == b"x"

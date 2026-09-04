@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 import llm_sandbox.app as appmod
 from llm_sandbox.models import ExecResult, FileEntry
+from llm_sandbox.providers.base import PathNotFound, SessionNotFound
 
 AUTH = {"Authorization": "Bearer test-token"}
 
@@ -237,3 +238,30 @@ def test_list_files_reports_truncation(client):
     assert r.status_code == 200
     assert r.json()["truncated"] is True
     assert r.json()["entries"][0]["name"] == "a"
+
+
+# --- status mapping --------------------------------------------------------------------------
+
+def test_provider_errors_become_the_right_status(client, monkeypatch):
+    sid = create(client)
+
+    async def gone(*_a, **_k):
+        raise SessionNotFound(sid)
+
+    async def no_file(*_a, **_k):
+        raise PathNotFound("head: /nope: No such file or directory")
+
+    async def broken(*_a, **_k):
+        raise RuntimeError("sandbox pod not ready (Pending) — pod unschedulable?")
+
+    monkeypatch.setattr(client.fake, "exec", gone)
+    r = client.post(f"/sessions/{sid}/exec", json={"command": "true"}, headers=AUTH)
+    assert (r.status_code, r.json()["detail"]) == (404, f"no such session: {sid}")
+
+    monkeypatch.setattr(client.fake, "read_file", no_file)
+    r = client.get(f"/sessions/{sid}/files", params={"path": "/nope"}, headers=AUTH)
+    assert r.status_code == 404 and "No such file" in r.json()["detail"]
+
+    monkeypatch.setattr(client.fake, "create", broken)
+    r = client.post("/sessions", json={}, headers=AUTH)
+    assert r.status_code == 502 and "unschedulable" in r.json()["detail"]

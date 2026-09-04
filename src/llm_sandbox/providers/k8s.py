@@ -40,8 +40,9 @@ from urllib.parse import urlencode
 
 import httpx
 from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import InvalidStatus
 
-from .base import TIMEOUT_EXIT, WORKDIR, SessionOpsMixin
+from .base import TIMEOUT_EXIT, WORKDIR, SessionNotFound, SessionOpsMixin
 
 log = logging.getLogger("llm_sandbox.k8s")
 
@@ -458,9 +459,14 @@ class K8sProvider(SessionOpsMixin):
             async with self._sem:
                 return await asyncio.wait_for(self._stream(url, stdin), timeout=timeout)
         except asyncio.TimeoutError:
-            # Dropping the stream is what stops the process: the kubelet kills an exec whose
-            # client went away. Same semantics the kubectl implementation had.
+            # Backstop only: the in-session `timeout` (SessionOpsMixin) is what actually
+            # stops the command — dropping this stream does not kill a non-TTY exec.
             return TIMEOUT_EXIT, b"", b"sandbox: operation timed out"
+        except InvalidStatus as exc:
+            # The upgrade was refused before any stream opened: 404 = no such pod.
+            if exc.response.status_code == 404:
+                raise SessionNotFound(session_id) from exc
+            raise RuntimeError(f"apiserver refused exec (HTTP {exc.response.status_code})") from exc
 
     async def _stream(self, url: str, stdin: bytes | None) -> tuple[int, bytes, bytes]:
         # Buffer at most one byte past the cap: that is the smallest amount that still lets
