@@ -9,13 +9,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import hmac
+import json
 import logging
 import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from .config import Config
 from .models import (CreateSessionRequest, ExecRequest, ExecResult, ListFilesResponse,
@@ -71,7 +75,9 @@ async def lifespan(_app: FastAPI):
         await provider.shutdown()
 
 
-app = FastAPI(title="llm-sandbox", version="0.1.0", lifespan=lifespan)
+# The OpenAPI/docs endpoints are unauthenticated; off unless explicitly asked for (dev).
+_docs = {} if cfg.expose_docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+app = FastAPI(title="llm-sandbox", version="0.1.0", lifespan=lifespan, **_docs)
 
 # language → (file extension, interpreter binary in the sandbox image)
 _RUNNERS = {"python": ("py", "python3")}
@@ -186,12 +192,87 @@ class SessionSlots:
 slots = SessionSlots(cfg.max_sessions)
 
 
+class BodyLimitMiddleware:
+    """Reject request bodies above ``limit`` bytes with 413.
+
+    Neither uvicorn nor Starlette caps the body, and every JSON body here is read whole into
+    memory before pydantic sees it — so without this a single oversized ``PUT .../files``
+    (or a chunked upload with no Content-Length) is an OOM of the service. Declared size is
+    checked up front; the actual bytes are counted as they stream in, so a lying or absent
+    Content-Length cannot get past it either.
+
+    The streaming check raises ``HTTPException`` from inside ``receive``: FastAPI's body
+    reader re-raises exactly that type (anything else becomes a generic 400), and the
+    ExceptionMiddleware below us turns it into the 413.
+    """
+
+    def __init__(self, app, limit: int) -> None:
+        self.app, self.limit = app, limit
+
+    def _detail(self) -> str:
+        return f"request body exceeds {self.limit} bytes (SANDBOX_MAX_REQUEST_BYTES)"
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        for name, value in scope.get("headers", ()):
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = 0
+                if declared > self.limit:
+                    return await self._reject(send)
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.limit:
+                    raise HTTPException(status_code=413, detail=self._detail())
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+    async def _reject(self, send) -> None:
+        # We sit outside the ExceptionMiddleware, so an early rejection is written by hand.
+        body = json.dumps({"detail": self._detail()}).encode()
+        await send({"type": "http.response.start", "status": 413,
+                    "headers": [(b"content-type", b"application/json"),
+                                (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
+
+
+app.add_middleware(BodyLimitMiddleware, limit=cfg.max_request_bytes)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(_request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's default 422 echoes ``input`` — the whole offending payload (megabytes of file
+    content, say) and, for a NaN, a value json cannot serialise, which turns the 422 into a
+    500. Report where and why, not what."""
+    errors = [{"loc": e.get("loc"), "msg": e.get("msg"), "type": e.get("type")}
+              for e in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
 async def _auth(authorization: str = Header(default="")) -> None:
     if not cfg.auth_token:
         return  # auth disabled (dev only)
     # Constant-time: a plain `!=` leaks the shared token a byte at a time under timing analysis.
-    if not hmac.compare_digest(authorization, f"Bearer {cfg.auth_token}"):
+    # Compared as bytes: the str form of compare_digest raises TypeError (→ 500) on any
+    # non-ASCII header value, and uvicorn decodes header bytes as latin-1.
+    presented = authorization.encode("latin-1", errors="replace")
+    expected = f"Bearer {cfg.auth_token}".encode("utf-8")
+    if not hmac.compare_digest(presented, expected):
         raise HTTPException(status_code=401, detail="missing or invalid bearer token")
+
+
+# Both providers mint ids as uuid4().hex[:16]; anything else is not ours and must not reach a
+# docker argv or an apiserver URL (a `?` or `#` in a path segment would rewrite the request).
+SessionId = Annotated[str, Path(pattern=r"^[0-9a-f]{16}$")]
 
 
 @app.get("/healthz")
@@ -215,22 +296,24 @@ async def create_session(req: CreateSessionRequest):
     # memory_mb/cpus are caller-supplied, so clamp before they reach the scheduler.
     memory_mb, cpus = clamp_resources(req.memory_mb, req.cpus,
                                       max_memory_mb=cfg.max_memory_mb, max_cpus=cfg.max_cpus)
+    # Lifetime too: an unbounded timeout is a slot (and a container) held forever.
+    timeout_seconds = min(req.timeout_seconds, cfg.max_session_seconds)
     # Count is capped too, not just per-session size (SANDBOX_MAX_SESSIONS).
     await slots.acquire()
     try:
-        sid = await provider.create(image=req.image, timeout_seconds=req.timeout_seconds,
+        sid = await provider.create(image=req.image, timeout_seconds=timeout_seconds,
                                     network=req.network, memory_mb=memory_mb, cpus=cpus)
     except BaseException:  # includes CancelledError — a dropped client must free the slot
         slots.rollback()
         raise
-    slots.commit(sid, req.timeout_seconds)
+    slots.commit(sid, timeout_seconds)
     log.info("CREATE   session=%s  provider=%s  network=%s  mem=%sMi  cpus=%s",
              sid, provider.name, req.network, memory_mb, cpus)
     return Session(session_id=sid, provider=provider.name)
 
 
 @app.delete("/sessions/{sid}", dependencies=[Depends(_auth)])
-async def destroy_session(sid: str):
+async def destroy_session(sid: SessionId):
     # Free the slot even if teardown errors: the provider's reaper is the backstop for the
     # pod, and holding the slot would only shrink the replica's capacity for good.
     slots.release(sid)
@@ -240,11 +323,13 @@ async def destroy_session(sid: str):
 
 
 @app.post("/sessions/{sid}/exec", response_model=ExecResult, dependencies=[Depends(_auth)])
-async def exec_command(sid: str, req: ExecRequest):
+async def exec_command(sid: SessionId, req: ExecRequest):
     """Run a shell command (awk/sed/bash/anything) — the universal file-manipulation primitive."""
     log.info("EXEC     session=%s  cmd (%s):\n%s", sid, _metrics(req.command),
              _block(req.command, _CMD_PREVIEW))
-    r = await provider.exec(sid, req.command, timeout_seconds=req.timeout_seconds,
+    # Bounded: an exec holds a backend slot (SANDBOX_MAX_CONCURRENCY) for its whole duration.
+    timeout_seconds = min(req.timeout_seconds, cfg.max_exec_seconds)
+    r = await provider.exec(sid, req.command, timeout_seconds=timeout_seconds,
                             workdir=req.workdir)
     log.info("EXEC     session=%s  exit=%s  dur=%sms  out=[%s]  truncated=%s", sid, r.exit_code,
              r.duration_ms, _metrics(r.stdout + r.stderr), r.truncated)
@@ -252,7 +337,7 @@ async def exec_command(sid: str, req: ExecRequest):
 
 
 @app.post("/sessions/{sid}/run", response_model=ExecResult, dependencies=[Depends(_auth)])
-async def run_code(sid: str, req: RunRequest):
+async def run_code(sid: SessionId, req: RunRequest):
     """Run Python (the only language in ``_RUNNERS`` — the image is python-only by design):
     write the code to a file in the session, then execute it. Composed on write_file + exec
     so every provider supports it uniformly."""
@@ -266,15 +351,16 @@ async def run_code(sid: str, req: RunRequest):
     # of the workspace listing the model reads back — cwd is still /workspace, so the script's
     # own relative paths resolve exactly as before.
     path = f"/tmp/_run_{req.language}_{uuid.uuid4().hex}.{ext}"
+    timeout_seconds = min(req.timeout_seconds, cfg.max_exec_seconds)
     await provider.write_file(sid, path, req.code, encoding="utf-8")
-    r = await provider.exec(sid, f"{interp} {path}", timeout_seconds=req.timeout_seconds)
+    r = await provider.exec(sid, f"{interp} {path}", timeout_seconds=timeout_seconds)
     log.info("RUN      session=%s  lang=%s  exit=%s  dur=%sms  out=[%s]", sid, req.language,
              r.exit_code, r.duration_ms, _metrics(r.stdout + r.stderr))
     return r
 
 
 @app.put("/sessions/{sid}/files", dependencies=[Depends(_auth)])
-async def write_file(sid: str, req: WriteFileRequest):
+async def write_file(sid: SessionId, req: WriteFileRequest):
     await provider.write_file(sid, req.path, req.content, encoding=req.encoding)
     log.info("WRITE    session=%s  path=%s  [%s]  enc=%s", sid, req.path,
              _payload_metrics(req.content, req.encoding), req.encoding)
@@ -282,7 +368,10 @@ async def write_file(sid: str, req: WriteFileRequest):
 
 
 @app.get("/sessions/{sid}/files", response_model=ReadFileResponse, dependencies=[Depends(_auth)])
-async def read_file(sid: str, path: str, max_bytes: int = 1_000_000):
+async def read_file(sid: SessionId, path: Annotated[str, Query(min_length=1)],
+                    max_bytes: Annotated[int, Query(ge=1)] = 1_000_000):
+    # ge=1 matters: a negative value reaches `head -c` as "all but the last N bytes", which
+    # would return the whole file and defeat the output cap.
     content, encoding, truncated = await provider.read_file(sid, path, max_bytes=max_bytes)
     log.info("READ     session=%s  path=%s  [%s]  enc=%s  truncated=%s", sid, path,
              _payload_metrics(content, encoding), encoding, truncated)
@@ -290,7 +379,7 @@ async def read_file(sid: str, path: str, max_bytes: int = 1_000_000):
 
 
 @app.get("/sessions/{sid}/files/list", response_model=ListFilesResponse, dependencies=[Depends(_auth)])
-async def list_files(sid: str, path: str = "/workspace"):
+async def list_files(sid: SessionId, path: Annotated[str, Query(min_length=1)] = "/workspace"):
     entries = await provider.list_files(sid, path)
     log.info("LIST     session=%s  path=%s  -> %d entries", sid, path, len(entries))
     return ListFilesResponse(path=path, entries=entries)

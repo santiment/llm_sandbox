@@ -195,6 +195,10 @@ gVisor (`runsc`) is the security boundary for untrusted LLM-written code.
   Set `network:true` per session only when needed.
 - Memory / CPU limits per session; pids capped (docker flag / kubelet `podPidsLimit`);
   output byte-capped (`SANDBOX_MAX_OUTPUT_BYTES`).
+- Every caller-supplied number is bounded: session and exec timeouts are clamped
+  (`SANDBOX_MAX_SESSION_SECONDS` / `SANDBOX_MAX_EXEC_SECONDS`), request bodies are capped
+  (`SANDBOX_MAX_REQUEST_BYTES` → 413), session ids must match the format the providers mint,
+  and `max_bytes` must be positive (a negative one would reach `head -c` as "all but N").
 - Session **count** capped per replica (`SANDBOX_MAX_SESSIONS`, default 24 → 429 when full),
   so a create loop can't pin the node group; on k8s the namespace ResourceQuota
   (`k8s/quota.yaml`) enforces the same ceiling cluster-side.
@@ -237,6 +241,10 @@ are set in `k8s/deployment.yaml`, not in a `.env`.
 | `SANDBOX_MAX_MEMORY_MB` | `4096` | Ceiling on a caller's `memory_mb` (clamped, not rejected) |
 | `SANDBOX_MAX_CPUS` | `2` | Ceiling on a caller's `cpus` (clamped, not rejected) |
 | `SANDBOX_MAX_CONCURRENCY` | `32` | In-flight backend ops across all sessions |
+| `SANDBOX_MAX_SESSION_SECONDS` | `3600` | Ceiling on a session's `timeout_seconds` (clamped) |
+| `SANDBOX_MAX_EXEC_SECONDS` | `600` | Ceiling on an exec/run `timeout_seconds` (clamped) |
+| `SANDBOX_MAX_REQUEST_BYTES` | `33554432` | HTTP body cap → 413; bounds file/code payloads |
+| `SANDBOX_EXPOSE_DOCS` | `0` | Serve unauthenticated `/docs`, `/openapi.json`. Dev only |
 | `SANDBOX_MAX_SESSIONS` | `24` | Live sessions **per replica** before 429; `0` = unlimited |
 | `SANDBOX_LOG_PAYLOADS` | `1` | Log command/code bodies. **Set `0` in prod** — untrusted content |
 | `SANDBOX_K8S_NAMESPACE` | *(own)* | Namespace for session pods |

@@ -49,6 +49,10 @@ class Config:
     max_memory_mb: int       # ceiling on a caller's per-session memory_mb
     max_cpus: float          # ceiling on a caller's per-session cpus
     max_concurrency: int     # in-flight backend operations across all sessions
+    max_session_seconds: int # ceiling on a caller's session timeout_seconds (clamped)
+    max_exec_seconds: int    # ceiling on a caller's exec/run timeout_seconds (clamped)
+    max_request_bytes: int   # HTTP request body cap (413 above it); bounds file/code payloads
+    expose_docs: bool        # serve /docs, /redoc, /openapi.json (unauthenticated) — dev only
     max_sessions: int        # live sessions this replica will hold; 0 = unlimited. Bounds the
                              # NUMBER of sandboxes (max_memory_mb/max_cpus only bound each
                              # one's size), so a create loop gets a 429 instead of the node
@@ -77,6 +81,10 @@ class Config:
             max_memory_mb=_int("SANDBOX_MAX_MEMORY_MB", 4096),
             max_cpus=float(_env("SANDBOX_MAX_CPUS", "2") or 2),
             max_concurrency=_int("SANDBOX_MAX_CONCURRENCY", 32),
+            max_session_seconds=_int("SANDBOX_MAX_SESSION_SECONDS", 3600),
+            max_exec_seconds=_int("SANDBOX_MAX_EXEC_SECONDS", 600),
+            max_request_bytes=_int("SANDBOX_MAX_REQUEST_BYTES", 32 * 1024 * 1024),
+            expose_docs=_flag("SANDBOX_EXPOSE_DOCS"),
             max_sessions=_int("SANDBOX_MAX_SESSIONS", 24),
             log_payloads=_flag("SANDBOX_LOG_PAYLOADS", default=True),
             # Defaults mirror the target cluster's gVisor setup: RuntimeClass `gvisor`,
