@@ -13,6 +13,7 @@ def build_provider(cfg: Config) -> SandboxProvider:
         return GvisorProvider(
             default_image=cfg.default_image,
             docker_runtime=cfg.docker_runtime,
+            docker_network=cfg.docker_network,
             max_output_bytes=cfg.max_output_bytes,
             max_concurrency=cfg.max_concurrency,
         )
@@ -26,6 +27,7 @@ def build_provider(cfg: Config) -> SandboxProvider:
             toleration=cfg.k8s_toleration,
             create_timeout=cfg.k8s_create_timeout,
             max_output_bytes=cfg.max_output_bytes,
+            disk_mb=cfg.disk_mb,
             image_pull_secrets=cfg.k8s_image_pull_secrets,
             max_concurrency=cfg.max_concurrency,
             reap_interval=cfg.k8s_reap_interval,

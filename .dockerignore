@@ -12,7 +12,7 @@ __pycache__
 *.egg-info
 **/*.egg-info
 .DS_Store
-k8s/
+example_k8s/
 .pytest_cache
 # tests/ stays IN the context: the Dockerfile `test` target copies it. The runtime stages
 # never COPY it, so shipped images are unaffected.

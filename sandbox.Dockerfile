@@ -46,7 +46,16 @@ WORKDIR /workspace
 # ImportError. Deliberately NO network clients (requests/curl): sandboxes must not make web
 # calls. The test suites ship ~40 MB of fixtures that nothing here can use; pandas.testing
 # lives in `_testing` and is untouched by this prune.
-RUN pip install --no-cache-dir pandas numpy openpyxl \
+#
+# Versions AND hashes come from sandbox-requirements.txt (compiled by uv under the same
+# exclude-newer window as the service's own lockfile): an unpinned `pip install pandas` made
+# this image the one artefact in the repo whose contents depended on the day it was built.
+# --require-hashes refuses anything whose digest differs; --only-binary refuses to build from
+# an sdist. Re-lock with ./update_safe_deps_date.sh --lock.
+COPY sandbox-requirements.txt /tmp/sandbox-requirements.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: \
+        -r /tmp/sandbox-requirements.txt \
+    && rm /tmp/sandbox-requirements.txt \
     && find /usr/local/lib/python3.11/site-packages \
          \( -type d -name tests -o -type d -name __pycache__ \) -prune -exec rm -rf {} + \
     && find /usr/local/lib/python3.11/site-packages -name '*.pyx' -delete

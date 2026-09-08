@@ -71,17 +71,32 @@ spec:
             # code defaults, which match the stage cluster. On a different cluster set
             # SANDBOX_K8S_RUNTIME_CLASS / SANDBOX_K8S_NODE_SELECTOR / SANDBOX_K8S_TOLERATION.
             # Ceilings on what a caller may request per session; the namespace ResourceQuota
-            # (k8s/quota.yaml) is the second line of defence behind these.
+            # (example_k8s/quota.yaml) is the second line of defence behind these.
             - name: SANDBOX_MAX_MEMORY_MB
               value: "4096"
             - name: SANDBOX_MAX_CPUS
               value: "2"
+            # Writable disk per session (ephemeral-storage limit). Keep under the LimitRange
+            # max in example_k8s/quota.yaml.
+            - name: SANDBOX_DISK_MB
+              value: "256"
             - name: SANDBOX_MAX_CONCURRENCY
               value: "32"
             # Live sessions PER REPLICA — 2 replicas × 24 = 48 session pods, which with the
             # 2 service pods is exactly the quota's count/pods: 50. Raise both together.
             - name: SANDBOX_MAX_SESSIONS
               value: "24"
+            # Defaults shown; uncomment to change. Callers may only request SANDBOX_IMAGE or
+            # an image listed here (comma-separated) — anything else is a 400.
+            # - name: SANDBOX_ALLOWED_IMAGES
+            #   value: ""
+            # Ceilings on caller-supplied timeouts (clamped) and on the request body (413).
+            # - name: SANDBOX_MAX_SESSION_SECONDS
+            #   value: "3600"
+            # - name: SANDBOX_MAX_EXEC_SECONDS
+            #   value: "600"
+            # - name: SANDBOX_MAX_REQUEST_BYTES
+            #   value: "33554432"
             # Off in prod: command/code bodies are untrusted LLM output and may carry
             # customer data — not something to fan out into cluster log retention.
             - name: SANDBOX_LOG_PAYLOADS

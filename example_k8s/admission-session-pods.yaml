@@ -1,0 +1,49 @@
+# OPTIONAL but recommended — requires Kubernetes >= 1.30 (ValidatingAdmissionPolicy GA).
+#
+# Makes the apiserver refuse any pod the service's ServiceAccount creates without the gVisor
+# RuntimeClass, with a ServiceAccount token, or without memory/ephemeral-storage limits — the
+# guarantee that holds even if the service is compromised. Keyed on the requesting user, not
+# a label (a label is what a compromised service would omit). PodSecurity `baseline` already
+# refuses privileged/host*/hostPath. Adjust the RuntimeClass name if yours is not `gvisor`.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: llm-sandbox-session-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: llm-sandbox
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: created-by-the-sandbox-service
+      expression: "request.userInfo.username == 'system:serviceaccount:llm-sandbox:llm-sandbox'"
+  # privileged / hostNetwork / hostPID / hostIPC / hostPath are already refused by the
+  # PodSecurity `baseline` label on the namespace — only what baseline does NOT check is here.
+  validations:
+    - expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == 'gvisor'"
+      message: "session pods must run under runtimeClassName: gvisor"
+    - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
+      message: "session pods must not mount a ServiceAccount token"
+    - expression: >-
+        object.spec.containers.all(c,
+          has(c.resources) && has(c.resources.limits) &&
+          'memory' in c.resources.limits && 'ephemeral-storage' in c.resources.limits)
+      message: "session containers must carry memory and ephemeral-storage limits"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: llm-sandbox-session-pods
+spec:
+  policyName: llm-sandbox-session-pods
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: llm-sandbox

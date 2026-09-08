@@ -1,6 +1,4 @@
-"""Env-driven configuration. ``SANDBOX_PROVIDER`` selects the backend; the HTTP API is
-identical either way, so callers never change when you switch providers.
-"""
+"""Env-driven configuration; every knob is documented in the README."""
 
 from __future__ import annotations
 
@@ -10,9 +8,7 @@ from pathlib import Path
 
 
 def _load_local_dotenv() -> None:
-    """Load this project's ``.env`` (if present) into the environment so a plain
-    ``uvicorn`` / ``uv run`` launch picks it up. Only ``setdefault`` — real env vars and
-    uvicorn ``--env-file`` still win."""
+    """Load the repo's ``.env`` via setdefault; real env vars win."""
     env_path = Path(__file__).resolve().parents[2] / ".env"
     if not env_path.exists():
         return
@@ -42,19 +38,22 @@ def _flag(name: str, default: bool = False) -> bool:
 @dataclass
 class Config:
     provider: str            # "gvisor" (docker, local) | "k8s" (pod-per-session on Kubernetes)
-    auth_token: str          # shared bearer; callers send `Authorization: Bearer <token>`. Empty = auth off (dev only).
+    auth_token: str          # bearer callers send; empty = auth off (dev only)
     default_image: str       # sandbox runtime image (built from sandbox.Dockerfile)
+    allowed_images: list[str]  # images a caller may pick via `image`; default_image is always allowed
     docker_runtime: str      # "runsc" (gVisor, prod) | "runc" (standard, dev only — NOT isolated)
+    docker_network: str      # docker network for network=true sessions ("bridge" = daemon default)
     max_output_bytes: int    # hard cap on any single stdout/stderr/file payload
     max_memory_mb: int       # ceiling on a caller's per-session memory_mb
     max_cpus: float          # ceiling on a caller's per-session cpus
+    disk_mb: int             # per-session writable-disk cap (k8s ephemeral-storage limit)
     max_concurrency: int     # in-flight backend operations across all sessions
-    max_sessions: int        # live sessions this replica will hold; 0 = unlimited. Bounds the
-                             # NUMBER of sandboxes (max_memory_mb/max_cpus only bound each
-                             # one's size), so a create loop gets a 429 instead of the node
-                             # group. Per-replica: N replicas ⇒ N × this.
-    log_payloads: bool       # log command/code bodies. Off in prod: they carry untrusted
-                             # LLM output and possibly customer data into cluster logs.
+    max_session_seconds: int # ceiling on a caller's session timeout_seconds (clamped)
+    max_exec_seconds: int    # ceiling on a caller's exec/run timeout_seconds (clamped)
+    max_request_bytes: int   # HTTP request body cap (413 above it); bounds file/code payloads
+    expose_docs: bool        # serve /docs, /redoc, /openapi.json (unauthenticated) — dev only
+    max_sessions: int        # live sessions per replica before 429; 0 = unlimited
+    log_payloads: bool       # log command/code bodies (untrusted content; off in prod)
 
     # --- k8s provider only (SANDBOX_PROVIDER=k8s) ---
     k8s_namespace: str       # namespace for session pods; "" = the service's own namespace
@@ -72,15 +71,20 @@ class Config:
             provider=_env("SANDBOX_PROVIDER", "gvisor").strip().lower(),
             auth_token=_env("LLM_SANDBOX_TOKEN"),
             default_image=_env("SANDBOX_IMAGE", "llm-sandbox-runtime:latest"),
+            allowed_images=[s.strip() for s in _env("SANDBOX_ALLOWED_IMAGES").split(",") if s.strip()],
             docker_runtime=_env("SANDBOX_DOCKER_RUNTIME", "runsc"),
+            docker_network=_env("SANDBOX_DOCKER_NETWORK", "bridge"),
             max_output_bytes=_int("SANDBOX_MAX_OUTPUT_BYTES", 1_000_000),
             max_memory_mb=_int("SANDBOX_MAX_MEMORY_MB", 4096),
             max_cpus=float(_env("SANDBOX_MAX_CPUS", "2") or 2),
+            disk_mb=_int("SANDBOX_DISK_MB", 256),
             max_concurrency=_int("SANDBOX_MAX_CONCURRENCY", 32),
+            max_session_seconds=_int("SANDBOX_MAX_SESSION_SECONDS", 3600),
+            max_exec_seconds=_int("SANDBOX_MAX_EXEC_SECONDS", 600),
+            max_request_bytes=_int("SANDBOX_MAX_REQUEST_BYTES", 32 * 1024 * 1024),
+            expose_docs=_flag("SANDBOX_EXPOSE_DOCS"),
             max_sessions=_int("SANDBOX_MAX_SESSIONS", 24),
             log_payloads=_flag("SANDBOX_LOG_PAYLOADS", default=True),
-            # Defaults mirror the target cluster's gVisor setup: RuntimeClass `gvisor`,
-            # instance group `ai-sandbox`, taint `dedicated=ai-sandbox:NoSchedule`.
             k8s_namespace=_env("SANDBOX_K8S_NAMESPACE"),
             k8s_runtime_class=_env("SANDBOX_K8S_RUNTIME_CLASS", "gvisor"),
             k8s_node_selector=_env("SANDBOX_K8S_NODE_SELECTOR",

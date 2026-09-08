@@ -12,6 +12,9 @@
 # was resolved under — so committing a moved date WITHOUT the re-locked uv.lock fails
 # CI (`uv lock --check`). Use --lock, and commit pyproject.toml + uv.lock together.
 #
+# The same window governs sandbox-requirements.txt (the runtime image's pandas/numpy/
+# openpyxl, pinned with hashes). --lock re-compiles it too; CI diffs it.
+#
 # Usage:
 #   ./update_safe_deps_date.sh --lock     # move the date, re-lock, sync (the normal path)
 #   ./update_safe_deps_date.sh            # move the date only — you MUST `uv lock` after
@@ -44,10 +47,17 @@ else:
     print(f"exclude-newer -> {safe}")
 PYEOF
 
+lock_sandbox_requirements() {
+    uv pip compile --quiet --no-header --generate-hashes --python-platform linux --python-version 3.11 \
+        --exclude-newer "$SAFE" sandbox-requirements.in -o sandbox-requirements.txt
+}
+
 if [[ "${1:-}" == "--lock" ]]; then
     uv lock
     uv sync
-    echo "Re-locked. Run the tests: uv run pytest -q"
+    lock_sandbox_requirements
+    echo "Re-locked uv.lock + sandbox-requirements.txt. Run the tests: uv run pytest -q"
 else
-    echo "Date updated. Now run: uv lock && uv sync  (then the tests)"
+    echo "Date updated. Now run: uv lock && uv sync  (then the tests), and re-compile"
+    echo "sandbox-requirements.txt (see lock_sandbox_requirements in this script)."
 fi
