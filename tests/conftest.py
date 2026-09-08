@@ -1,9 +1,4 @@
-"""Test env for the HTTP layer.
-
-``llm_sandbox.app`` builds its Config and provider at import time (and Config loads the
-repo's ``.env`` via setdefault), so the knobs the app tests rely on are pinned here — before
-any test module imports the app — where real env vars win over the dotenv.
-"""
+"""Pin the env the app reads at import time (real env vars win over the repo's .env)."""
 
 import os
 

@@ -1,6 +1,4 @@
-"""HTTP-layer tests: auth, input bounds, slot accounting — against a fake provider, so no
-docker daemon or cluster is involved. These are the edges every caller-supplied value crosses
-before it reaches a docker argv or an apiserver URL."""
+"""HTTP layer against a fake provider: auth, input bounds, status mapping, slot accounting."""
 
 from __future__ import annotations
 
@@ -11,7 +9,7 @@ from fastapi.testclient import TestClient
 
 import llm_sandbox.app as appmod
 from llm_sandbox.models import ExecResult, FileEntry
-from llm_sandbox.providers.base import PathNotFound, SessionNotFound
+from llm_sandbox.providers.base import PathNotFound, SandboxError, SessionNotFound
 
 AUTH = {"Authorization": "Bearer test-token"}
 
@@ -93,8 +91,7 @@ def test_auth_required(client):
 
 
 async def test_auth_compare_survives_a_non_ascii_header():
-    """uvicorn hands header values over latin-1 decoded; the str form of compare_digest raises
-    TypeError on anything non-ASCII, which would surface as a 500 instead of a 401."""
+    """The str form of compare_digest raises TypeError on non-ASCII header values (→ 500)."""
     with pytest.raises(appmod.HTTPException) as e:
         await appmod._auth("Bearer t\xe9st")
     assert e.value.status_code == 401
@@ -199,9 +196,7 @@ def test_session_cap_returns_429_and_delete_frees_a_slot(client):
 
 
 def test_slots_resync_with_the_backend_when_the_cap_is_hit(client):
-    """A DELETE served by a sibling replica never reaches this replica's release(); at the cap
-    we ask the backend what still exists and drop the rest instead of 429ing for up to a full
-    session lifetime."""
+    """A DELETE served by a sibling replica never reaches this replica's release()."""
     a = create(client)
     create(client)
     client.fake.sessions.discard(a)                       # destroyed "via another replica"
@@ -252,7 +247,7 @@ def test_provider_errors_become_the_right_status(client, monkeypatch):
         raise PathNotFound("head: /nope: No such file or directory")
 
     async def broken(*_a, **_k):
-        raise RuntimeError("sandbox pod not ready (Pending) — pod unschedulable?")
+        raise SandboxError("sandbox pod not ready (Pending) — pod unschedulable?")
 
     monkeypatch.setattr(client.fake, "exec", gone)
     r = client.post(f"/sessions/{sid}/exec", json={"command": "true"}, headers=AUTH)
@@ -265,3 +260,17 @@ def test_provider_errors_become_the_right_status(client, monkeypatch):
     monkeypatch.setattr(client.fake, "create", broken)
     r = client.post("/sessions", json={}, headers=AUTH)
     assert r.status_code == 502 and "unschedulable" in r.json()["detail"]
+
+
+def test_a_plain_runtime_error_is_still_a_500(monkeypatch):
+    """Only provider failures get the 502 treatment."""
+    fake = FakeProvider()
+
+    async def bug(*_a, **_k):
+        raise RuntimeError("internal")
+
+    fake.create = bug
+    monkeypatch.setattr(appmod, "provider", fake)
+    monkeypatch.setattr(appmod, "slots", appmod.SessionSlots(0))
+    with TestClient(appmod.app, raise_server_exceptions=False) as c:
+        assert c.post("/sessions", json={}, headers=AUTH).status_code == 500

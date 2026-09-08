@@ -1,21 +1,10 @@
 # OPTIONAL but recommended — requires Kubernetes >= 1.30 (ValidatingAdmissionPolicy GA).
 #
-# The service holds `create pods` + `pods/exec` in this namespace. If it were ever compromised
-# (a bug in the HTTP layer, a leaked bearer token plus an RCE), the attacker could ask the
-# apiserver for a pod WITHOUT runtimeClassName: gvisor — i.e. run untrusted code under runc on
-# the sandbox nodes — or one with a ServiceAccount token mounted. PodSecurity `baseline`
-# (k8s/namespace.yaml) does not stop either.
-#
-# This policy is the cluster-side guarantee our own code cannot bypass: every pod CREATED BY
-# THE SERVICE'S SERVICEACCOUNT must carry the gVisor RuntimeClass and the no-credentials
-# posture the provider sets. It is keyed on the requesting user, not on a label, because a
-# label is exactly what a compromised service would omit. The service's own pods are created
-# by the ReplicaSet controller, so they are not subject to it.
-#
-#   kubectl apply -f k8s/admission-session-pods.yaml
-#
-# If your RuntimeClass is not named `gvisor`, change it in BOTH `validations` and the
-# service's SANDBOX_K8S_RUNTIME_CLASS.
+# Makes the apiserver refuse any pod the service's ServiceAccount creates without the gVisor
+# RuntimeClass, with a ServiceAccount token, or without memory/ephemeral-storage limits — the
+# guarantee that holds even if the service is compromised. Keyed on the requesting user, not
+# a label (a label is what a compromised service would omit). PodSecurity `baseline` already
+# refuses privileged/host*/hostPath. Adjust the RuntimeClass name if yours is not `gvisor`.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:

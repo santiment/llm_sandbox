@@ -35,15 +35,15 @@ spec:
       default:
         cpu: "1"
         memory: 512Mi
-        ephemeral-storage: 1Gi
+        ephemeral-storage: 256Mi
       defaultRequest:
         cpu: 100m
         memory: 64Mi
         ephemeral-storage: 64Mi
       # Keep in step with SANDBOX_MAX_CPUS / SANDBOX_MAX_MEMORY_MB / SANDBOX_DISK_MB in
-      # k8s/deployment.yaml. ephemeral-storage is the session's writable disk: without a cap a
+      # example_k8s/deployment.yaml. ephemeral-storage is the session's writable disk: without a cap a
       # session can fill the node and evict its neighbours.
       max:
         cpu: "2"
         memory: 4Gi
-        ephemeral-storage: 4Gi
+        ephemeral-storage: 1Gi

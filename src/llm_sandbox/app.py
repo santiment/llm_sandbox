@@ -1,8 +1,4 @@
-"""HTTP interface — THE contract every caller (a backend, an agent, …) calls. It is identical
-regardless of which provider backs it; swapping the provider is a server-side env change.
-
-Run:  uv run uvicorn llm_sandbox.app:app --host 0.0.0.0 --port 8900   (see README)
-"""
+"""HTTP interface. Run: uv run uvicorn llm_sandbox.app:app --host 0.0.0.0 --port 8900"""
 
 from __future__ import annotations
 
@@ -23,18 +19,15 @@ from .config import Config
 from .models import (CreateSessionRequest, ExecRequest, ExecResult, ListFilesResponse,
                      ReadFileResponse, RunRequest, Session, WriteFileRequest)
 from .providers import build_provider
-from .providers.base import PathNotFound, SessionNotFound, clamp_resources
+from .providers.base import PathNotFound, SandboxError, SessionNotFound, clamp_resources
 
-# Preview caps — how much of a command/script body lands in the log. Scripts often live inside
-# an EXEC heredoc (`cat << EOF > file.py …`), so the cmd cap is generous: the log is the audit
-# trail for "what actually ran".
+# How much of a command/script body lands in the log.
 _CMD_PREVIEW = 2000
 _CODE_PREVIEW = 4000
 
 
 def _setup_logging() -> logging.Logger:
-    """Human-readable, timestamped logs for the whole ``llm_sandbox`` tree (app + providers).
-    Own handler + no propagation so uvicorn's root config can't strip our timestamps."""
+    """Own handler, no propagation: uvicorn's log config must not strip our format."""
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter(
         fmt="%(asctime)s.%(msecs)03d  %(levelname)-4s  %(message)s",
@@ -55,16 +48,13 @@ provider = build_provider(cfg)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Provider pools and background tasks need a running loop, so they start here rather
-    than at import. Preflight runs once and its result backs ``/readyz``."""
     await provider.startup()
     try:
         await provider.preflight()
         _app.state.ready, _app.state.not_ready_reason = True, ""
         log.info("provider %s ready", provider.name)
     except Exception as exc:
-        # Do NOT crash: a CrashLoopBackOff hides the reason behind a restart counter,
-        # whereas an unready pod keeps /readyz serving the actual error to whoever looks.
+        # Stay up but unready: /readyz then serves the reason instead of a restart loop.
         _app.state.ready, _app.state.not_ready_reason = False, str(exc)
         log.error("provider %s NOT ready: %s", provider.name, exc)
     try:
@@ -73,7 +63,7 @@ async def lifespan(_app: FastAPI):
         await provider.shutdown()
 
 
-# The OpenAPI/docs endpoints are unauthenticated; off unless explicitly asked for (dev).
+# /docs is unauthenticated; off unless asked for.
 _docs = {} if cfg.expose_docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
 app = FastAPI(title="llm-sandbox", version="0.1.0", lifespan=lifespan, **_docs)
 
@@ -94,9 +84,7 @@ def _human_bytes(n: int) -> str:
 
 
 def _metrics(*texts: str) -> str:
-    """Compact content summary: bytes · lines · rough token estimate (~chars÷4). Several
-    texts (stdout + stderr) are summed without concatenating them, and the byte count skips
-    the encode pass for ASCII — these run on every request against up-to-megabyte payloads."""
+    """Compact content summary: bytes · lines · rough token estimate (~chars÷4)."""
     nbytes = nlines = nchars = 0
     for text in texts:
         if not text:
@@ -108,8 +96,7 @@ def _metrics(*texts: str) -> str:
 
 
 def _payload_metrics(content: str, encoding: str) -> str:
-    """Size summary for a file payload. base64 → decoded byte size, computed from the length
-    (chars×3/4 minus padding) rather than by actually decoding megabytes for a log line."""
+    """Size summary for a file payload; base64 → decoded size, computed, not decoded."""
     if encoding == "base64":
         stripped = content.rstrip("=\n\r ")
         raw = len(stripped) * 3 // 4
@@ -118,8 +105,7 @@ def _payload_metrics(content: str, encoding: str) -> str:
 
 
 def _block(text: str, cap: int) -> str:
-    """Render a (possibly multi-line) command/script under a ``  |`` gutter for readability.
-    Returns a placeholder when payload logging is off — see ``SANDBOX_LOG_PAYLOADS``."""
+    """Indent a command/script under a ``  |`` gutter; placeholder when payload logging is off."""
     if not cfg.log_payloads:
         return "  | <payload logging disabled (SANDBOX_LOG_PAYLOADS)>"
     body = _preview(text, cap)
@@ -127,24 +113,9 @@ def _block(text: str, cap: int) -> str:
 
 
 class SessionSlots:
-    """Ceiling on LIVE sessions, enforced by this replica.
-
-    Every session is a container/pod. Nothing else bounds their NUMBER: the per-session
-    memory/cpu clamps bound each one's size, and the namespace ResourceQuota
-    (``k8s/quota.yaml``) is a cluster-side backstop that exists only under k8s and surfaces
-    as an opaque admission failure. This cap is provider-agnostic and answers a clean 429,
-    so a caller looping ``POST /sessions`` gets told to back off instead of pinning the
-    sandbox node group (or, under the docker provider, the host).
-
-    Sessions are tracked as ``session_id → deadline``, not as a plain count: a session can
-    also disappear on its own (it self-terminates after ``timeout_seconds`` with no DELETE),
-    and a counter that only went up on create would drift until the service refused every
-    request. A slot therefore frees on ``DELETE`` or once its deadline passes — the same
-    deadline the provider reaps on, so the count follows reality without polling for it.
-
-    PER-REPLICA: N replicas allow N × limit sessions. Size the ResourceQuota accordingly.
-    ``limit <= 0`` disables the cap entirely.
-    """
+    """Per-replica cap on live sessions (429 when full). Tracked as id → deadline, not a
+    counter, so a session that self-terminates frees its slot without a DELETE.
+    N replicas allow N × limit; ``limit <= 0`` disables the cap."""
 
     def __init__(self, limit: int, recount=None) -> None:
         self._limit = limit
@@ -160,8 +131,7 @@ class SessionSlots:
         return len(self._deadlines) + self._pending
 
     async def acquire(self) -> None:
-        """Reserve a slot or raise 429. Held under a lock and counted BEFORE the (awaited)
-        create, so concurrent requests can't all pass the check and overshoot together."""
+        """Reserve a slot or raise 429; counted under the lock, before the awaited create."""
         if self._limit <= 0:
             return
         async with self._lock:
@@ -178,11 +148,7 @@ class SessionSlots:
             self._pending += 1
 
     async def _resync(self) -> int:
-        """Only when the cap is hit: ask the backend which of the sessions we hold slots for
-        still exist, and drop the rest. Any replica can serve any request, so a DELETE that
-        lands on a sibling never reaches our ``release`` — without this, those slots would
-        stay taken until their deadline (up to SANDBOX_MAX_SESSION_SECONDS) and a busy
-        replica would 429 with capacity to spare."""
+        """At the cap only: drop slots for sessions the backend no longer has."""
         try:
             actual = await asyncio.wait_for(self._recount(), timeout=10)
         except Exception as exc:
@@ -199,14 +165,12 @@ class SessionSlots:
         return self._live()
 
     def commit(self, sid: str, timeout_seconds: int) -> None:
-        """Creation succeeded: turn the reservation into a real, expiring slot."""
         if self._limit <= 0:
             return
         self._pending = max(0, self._pending - 1)
         self._deadlines[sid] = time.monotonic() + max(0, timeout_seconds)
 
     def rollback(self) -> None:
-        """Creation failed: give the reservation back, or the cap ratchets shut."""
         if self._limit <= 0:
             return
         self._pending = max(0, self._pending - 1)
@@ -219,18 +183,8 @@ slots = SessionSlots(cfg.max_sessions, recount=provider.live_session_ids)
 
 
 class BodyLimitMiddleware:
-    """Reject request bodies above ``limit`` bytes with 413.
-
-    Neither uvicorn nor Starlette caps the body, and every JSON body here is read whole into
-    memory before pydantic sees it — so without this a single oversized ``PUT .../files``
-    (or a chunked upload with no Content-Length) is an OOM of the service. Declared size is
-    checked up front; the actual bytes are counted as they stream in, so a lying or absent
-    Content-Length cannot get past it either.
-
-    The streaming check raises ``HTTPException`` from inside ``receive``: FastAPI's body
-    reader re-raises exactly that type (anything else becomes a generic 400), and the
-    ExceptionMiddleware below us turns it into the 413.
-    """
+    """413 for bodies above ``limit``: declared Content-Length up front, actual bytes as they
+    stream. Raises HTTPException from ``receive`` — the one type FastAPI re-raises as-is."""
 
     def __init__(self, app, limit: int) -> None:
         self.app, self.limit = app, limit
@@ -263,7 +217,6 @@ class BodyLimitMiddleware:
         await self.app(scope, limited_receive, send)
 
     async def _reject(self, send) -> None:
-        # We sit outside the ExceptionMiddleware, so an early rejection is written by hand.
         body = json.dumps({"detail": self._detail()}).encode()
         await send({"type": "http.response.start", "status": 413,
                     "headers": [(b"content-type", b"application/json"),
@@ -284,20 +237,16 @@ async def _path_not_found(_request, exc: PathNotFound) -> JSONResponse:
     return JSONResponse(status_code=404, content={"detail": str(exc)})
 
 
-@app.exception_handler(RuntimeError)
-async def _backend_failure(_request, exc: RuntimeError) -> JSONResponse:
-    """Provider failures (daemon/apiserver said no, pod never got ready, write failed) are
-    502s with the provider's own hint — which names the fix — rather than an anonymous 500
-    whose only trace is a stack in the pod log."""
+@app.exception_handler(SandboxError)
+async def _backend_failure(_request, exc: SandboxError) -> JSONResponse:
+    """Provider failures → 502 carrying the provider's hint. Anything else stays a 500."""
     log.error("BACKEND  %s", exc)
     return JSONResponse(status_code=502, content={"detail": str(exc)})
 
 
 @app.exception_handler(RequestValidationError)
 async def _validation_error(_request, exc: RequestValidationError) -> JSONResponse:
-    """FastAPI's default 422 echoes ``input`` — the whole offending payload (megabytes of file
-    content, say) and, for a NaN, a value json cannot serialise, which turns the 422 into a
-    500. Report where and why, not what."""
+    """422 without echoing ``input``: it can be megabytes, or a NaN json cannot serialise."""
     errors = [{"loc": e.get("loc"), "msg": e.get("msg"), "type": e.get("type")}
               for e in exc.errors()]
     return JSONResponse(status_code=422, content={"detail": errors})
@@ -306,24 +255,20 @@ async def _validation_error(_request, exc: RequestValidationError) -> JSONRespon
 async def _auth(authorization: str = Header(default="")) -> None:
     if not cfg.auth_token:
         return  # auth disabled (dev only)
-    # Constant-time: a plain `!=` leaks the shared token a byte at a time under timing analysis.
-    # Compared as bytes: the str form of compare_digest raises TypeError (→ 500) on any
-    # non-ASCII header value, and uvicorn decodes header bytes as latin-1.
+    # Constant-time, and as bytes: the str form raises TypeError on non-ASCII header values.
     presented = authorization.encode("latin-1", errors="replace")
     expected = f"Bearer {cfg.auth_token}".encode("utf-8")
     if not hmac.compare_digest(presented, expected):
         raise HTTPException(status_code=401, detail="missing or invalid bearer token")
 
 
-# Both providers mint ids as uuid4().hex[:16]; anything else is not ours and must not reach a
-# docker argv or an apiserver URL (a `?` or `#` in a path segment would rewrite the request).
+# Providers mint ids as uuid4().hex[:16]; anything else must not reach an argv or URL.
 SessionId = Annotated[str, Path(pattern=r"^[0-9a-f]{16}$")]
 
 
 @app.get("/healthz")
 async def healthz():
-    """Liveness: is the process serving? Deliberately shallow — a backend outage must not
-    restart-loop this pod."""
+    """Liveness, shallow on purpose: a backend outage must not restart-loop the pod."""
     return {"ok": True, "provider": provider.name}
 
 
@@ -337,10 +282,7 @@ async def readyz():
 
 
 def _resolve_image(requested: str | None) -> str:
-    """The `image` field is public API and lands in a pod spec / docker argv, so it is an
-    allowlist, not a free string: any pullable ref would otherwise run under our registry
-    credentials (image pull secrets, the daemon's ECR login) — i.e. a token holder could pull
-    and read any private image, or pull anything at all onto the sandbox nodes."""
+    """Allowlist, not a free string: any pullable ref would run under our registry credentials."""
     if requested is None or requested == cfg.default_image:
         return cfg.default_image
     if requested in cfg.allowed_images:
@@ -354,17 +296,14 @@ def _resolve_image(requested: str | None) -> str:
 @app.post("/sessions", response_model=Session, dependencies=[Depends(_auth)])
 async def create_session(req: CreateSessionRequest):
     image = _resolve_image(req.image)
-    # memory_mb/cpus are caller-supplied, so clamp before they reach the scheduler.
     memory_mb, cpus = clamp_resources(req.memory_mb, req.cpus,
                                       max_memory_mb=cfg.max_memory_mb, max_cpus=cfg.max_cpus)
-    # Lifetime too: an unbounded timeout is a slot (and a container) held forever.
     timeout_seconds = min(req.timeout_seconds, cfg.max_session_seconds)
-    # Count is capped too, not just per-session size (SANDBOX_MAX_SESSIONS).
     await slots.acquire()
     try:
         sid = await provider.create(image=image, timeout_seconds=timeout_seconds,
                                     network=req.network, memory_mb=memory_mb, cpus=cpus)
-    except BaseException:  # includes CancelledError — a dropped client must free the slot
+    except BaseException:  # incl. CancelledError: a dropped client must free the slot
         slots.rollback()
         raise
     slots.commit(sid, timeout_seconds)
@@ -375,8 +314,7 @@ async def create_session(req: CreateSessionRequest):
 
 @app.delete("/sessions/{sid}", dependencies=[Depends(_auth)])
 async def destroy_session(sid: SessionId):
-    # Free the slot even if teardown errors: the provider's reaper is the backstop for the
-    # pod, and holding the slot would only shrink the replica's capacity for good.
+    # Free the slot even if teardown fails; the provider's reaper is the backstop.
     slots.release(sid)
     await provider.destroy(sid)
     log.info("DESTROY  session=%s", sid)
@@ -385,10 +323,8 @@ async def destroy_session(sid: SessionId):
 
 @app.post("/sessions/{sid}/exec", response_model=ExecResult, dependencies=[Depends(_auth)])
 async def exec_command(sid: SessionId, req: ExecRequest):
-    """Run a shell command (awk/sed/bash/anything) — the universal file-manipulation primitive."""
     log.info("EXEC     session=%s  workdir=%r  cmd (%s):\n%s", sid, req.workdir,
              _metrics(req.command), _block(req.command, _CMD_PREVIEW))
-    # Bounded: an exec holds a backend slot (SANDBOX_MAX_CONCURRENCY) for its whole duration.
     timeout_seconds = min(req.timeout_seconds, cfg.max_exec_seconds)
     r = await provider.exec(sid, req.command, timeout_seconds=timeout_seconds,
                             workdir=req.workdir)
@@ -399,15 +335,10 @@ async def exec_command(sid: SessionId, req: ExecRequest):
 
 @app.post("/sessions/{sid}/run", response_model=ExecResult, dependencies=[Depends(_auth)])
 async def run_code(sid: SessionId, req: RunRequest):
-    """Run Python (the only language in ``_RUNNERS`` — the image is python-only by design):
-    save the code to a scratch file in the session and execute it, in one exec. Implemented
-    once in ``SessionOpsMixin`` so every provider behaves identically."""
-    # The full executed program is logged (preview) — this is the audit trail for "what ran".
     log.info("RUN      session=%s  lang=%s  code (%s):\n%s", sid, req.language,
              _metrics(req.code), _block(req.code, _CODE_PREVIEW))
     ext, interp = _RUNNERS[req.language]
     timeout_seconds = min(req.timeout_seconds, cfg.max_exec_seconds)
-    # One round-trip: the script travels on stdin and the same exec saves and runs it.
     r = await provider.run_script(sid, req.code, interpreter=interp, ext=ext,
                                   timeout_seconds=timeout_seconds)
     log.info("RUN      session=%s  lang=%s  exit=%s  dur=%sms  out=[%s]", sid, req.language,
@@ -426,8 +357,7 @@ async def write_file(sid: SessionId, req: WriteFileRequest):
 @app.get("/sessions/{sid}/files", response_model=ReadFileResponse, dependencies=[Depends(_auth)])
 async def read_file(sid: SessionId, path: Annotated[str, Query(min_length=1)],
                     max_bytes: Annotated[int, Query(ge=1)] = 1_000_000):
-    # ge=1 matters: a negative value reaches `head -c` as "all but the last N bytes", which
-    # would return the whole file and defeat the output cap.
+    # ge=1: a negative value reaches `head -c` as "all but the last N bytes".
     content, encoding, truncated = await provider.read_file(sid, path, max_bytes=max_bytes)
     log.info("READ     session=%s  path=%r  [%s]  enc=%s  truncated=%s", sid, path,
              _payload_metrics(content, encoding), encoding, truncated)

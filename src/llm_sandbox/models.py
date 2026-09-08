@@ -1,6 +1,4 @@
-"""Wire contract for the sandbox HTTP API — the SAME request/response shapes for every
-caller, regardless of which provider (gVisor, …) runs underneath.
-"""
+"""Wire contract for the HTTP API."""
 
 from __future__ import annotations
 
@@ -11,18 +9,13 @@ from pydantic import BaseModel, Field, model_validator
 
 Encoding = Literal["utf-8", "base64"]
 
-# Every field below is caller-supplied and therefore attacker-controlled input. Bounds here
-# are the hard floor; the config-driven ceilings (SANDBOX_MAX_*_SECONDS, ...) are applied by
-# clamping in app.py, so an out-of-range ask degrades to the cap instead of a 422.
-
-# base64 alphabet + padding + whitespace; anything else would only fail inside the sandbox
-# (`base64 -d`) and surface as a 500 — reject it at the edge as a 422 instead.
+# Hard floors live here; the config-driven ceilings are applied by clamping in app.py.
 _BASE64_RE = re.compile(r"^[A-Za-z0-9+/=\s]*$")
 
 
 class CreateSessionRequest(BaseModel):
-    image: Optional[str] = Field(None, min_length=1, max_length=512)  # must be allowlisted (SANDBOX_ALLOWED_IMAGES)
-    timeout_seconds: int = Field(900, ge=1)   # session auto-reaps after this; clamped to SANDBOX_MAX_SESSION_SECONDS
+    image: Optional[str] = Field(None, min_length=1, max_length=512)  # allowlisted (SANDBOX_ALLOWED_IMAGES)
+    timeout_seconds: int = Field(900, ge=1)   # clamped to SANDBOX_MAX_SESSION_SECONDS
     network: bool = False                     # default-deny egress; True opens outbound
     memory_mb: int = 512                      # clamped to SANDBOX_MAX_MEMORY_MB
     cpus: float = Field(1.0, allow_inf_nan=False)  # clamped to SANDBOX_MAX_CPUS
@@ -34,13 +27,13 @@ class Session(BaseModel):
 
 
 class ExecRequest(BaseModel):
-    command: str                         # a shell command line: awk / sed / bash / anything
+    command: str
     timeout_seconds: int = Field(60, ge=1)   # clamped to SANDBOX_MAX_EXEC_SECONDS
     workdir: Optional[str] = Field(None, min_length=1)  # defaults to /workspace
 
 
 class RunRequest(BaseModel):
-    language: Literal["python"]          # python-only sandbox (runtime image ships no node)
+    language: Literal["python"]
     code: str
     timeout_seconds: int = Field(60, ge=1)   # clamped to SANDBOX_MAX_EXEC_SECONDS
 

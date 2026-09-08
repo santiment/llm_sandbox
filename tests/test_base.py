@@ -1,5 +1,4 @@
-"""The shared plumbing every provider stands on: the subprocess runner (docker provider) and
-the in-session command wrapper. Real local subprocesses, no docker."""
+"""Shared plumbing: the subprocess runner and the in-session command wrappers. No docker."""
 
 from __future__ import annotations
 
@@ -74,7 +73,7 @@ async def test_run_script_is_one_exec_with_the_code_on_stdin():
     assert len(r.calls) == 1
     assert cmd[:2] == ("sh", "-c")
     script = cmd[2]
-    assert script.startswith("cat > /tmp/_run_") and ".py && cd /workspace && timeout -k 1 9 python3 /tmp/_run_" in script
+    assert script.startswith("cat > /tmp/_run_") and "&& cd /workspace && timeout -k 1 9 python3 /tmp/_run_" in script
     assert script.endswith("; rc=$?; rm -f " + script.split("cat > ")[1].split(" ")[0] + "; exit $rc")
     assert stdin == b"print(1)"
     assert timeout == 14
@@ -88,5 +87,29 @@ async def test_write_file_creates_the_right_parent_for_every_path_shape():
         r.calls.clear()
         await r.write_file("s", path, "x")
         cmd, stdin, _t = r.calls[0]
-        assert cmd[2].startswith(f"mkdir -p {parent} && cat > "), (path, cmd[2])
+        assert cmd[2].startswith(f"mkdir -p {parent} && cat > {path}.partial-"), (path, cmd[2])
         assert stdin == b"x"
+
+
+async def test_write_file_is_size_checked_and_atomic():
+    """A cut stream gives `cat` a clean EOF; the byte check and temp+mv keep partials out."""
+    r = Recorder()
+    await r.write_file("s", "/workspace/f.txt", "héllo")          # 6 bytes utf-8
+    script = r.calls[0][0][2]
+    tmp = script.split("cat > ")[1].split(" ")[0]
+    assert tmp.startswith("/workspace/f.txt.partial-")
+    assert f'&& [ "$(wc -c < {tmp})" -eq 6 ] && mv -f {tmp} /workspace/f.txt; rc=$?; rm -f {tmp}; exit $rc' in script
+
+    r.calls.clear()
+    await r.write_file("s", "/workspace/b.bin", "AAEC/w==", encoding="base64")
+    script = r.calls[0][0][2]
+    tmp = script.split("cat > ")[1].split(" ")[0]
+    assert f'-eq 8 ] && base64 -d {tmp} > /workspace/b.bin || {{ rm -f /workspace/b.bin; false; }}; rc=$?' in script
+
+
+async def test_run_script_refuses_to_run_a_truncated_upload():
+    r = Recorder()
+    await r.run_script("s", "print(1)", interpreter="python3", ext="py", timeout_seconds=5)
+    script = r.calls[0][0][2]
+    path = script.split("cat > ")[1].split(" ")[0]
+    assert f'cat > {path} && [ "$(wc -c < {path})" -eq 8 ] && cd /workspace && timeout -k 1 5 python3 {path};' in script

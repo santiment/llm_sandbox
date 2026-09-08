@@ -5,7 +5,7 @@
 # the only thing in the way. With it, reachability is restricted to namespaces that opt in:
 #
 #   kubectl label namespace <backend-ns> llm-sandbox/client=true
-#   kubectl apply -f k8s/networkpolicy-client-ingress.yaml
+#   kubectl apply -f example_k8s/networkpolicy-client-ingress.yaml
 #
 # Note this is a default-deny for the SERVICE pods' ingress: once applied, only labelled
 # namespaces (plus the kubelet's probe traffic, which does not traverse a NetworkPolicy) get in.

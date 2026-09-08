@@ -1,16 +1,5 @@
-"""Tests for the Kubernetes provider.
-
-The provider talks to a real apiserver, which these tests must never do — so the two halves
-of its wire protocol are exercised against local fakes instead:
-
-* the REST verbs (create / wait-ready / destroy) against a scripted ``FakeApi``;
-* ``exec`` against a real local WebSocket server speaking the actual ``v5.channel.k8s.io``
-  framing — channel-prefixed binary frames, the stdin close frame, and the JSON ``Status``
-  on the error channel that carries the exit code.
-
-That second half is the piece with no other safety net: it replaced ``kubectl exec``, and a
-cluster is the only other place it runs.
-"""
+"""Kubernetes provider against local fakes: REST verbs via a scripted ``FakeApi``, ``exec``
+via a real local WebSocket server speaking the ``v5.channel.k8s.io`` framing."""
 
 from __future__ import annotations
 
@@ -48,8 +37,7 @@ def waiting(reason: str) -> tuple[int, dict]:
 # --- fakes ---------------------------------------------------------------------------------
 
 class FakeApi:
-    """Stands in for ApiServer. ``routes`` is a list of ``(method, path_substring, response)``,
-    first match wins; an unmatched call returns ``(200, {})``."""
+    """``routes``: ``(method, path_substring, response)``; first match wins, else ``(200, {})``."""
 
     def __init__(self, routes=(), ws_port=None):
         self.routes = list(routes)
@@ -131,8 +119,7 @@ def test_exit_code_from_status():
 # --- guards --------------------------------------------------------------------------------
 
 def test_empty_runtime_class_refuses_to_start():
-    """Fail-open is the dangerous direction: no RuntimeClass means untrusted code runs under
-    runc with no gVisor boundary at all."""
+    """No RuntimeClass means untrusted code under runc; refuse rather than fail open."""
     with pytest.raises(RuntimeError, match="NOT an isolation boundary"):
         provider(FakeApi(), runtime_class="")
 
@@ -161,7 +148,7 @@ def test_manifest_security_and_placement():
     assert container["args"] == ["sleep", "900"]
     assert "command" not in container
     assert container["resources"]["limits"] == {"cpu": "1.0", "memory": "512Mi",
-                                                "ephemeral-storage": "1024Mi"}
+                                                "ephemeral-storage": "256Mi"}
     assert container["securityContext"] == {
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
@@ -194,7 +181,7 @@ async def test_create_waits_for_ready():
 
 async def test_create_forbidden_names_the_fix():
     api = FakeApi([("POST", "/pods", (403, {"message": "pods is forbidden"}))])
-    with pytest.raises(RuntimeError, match=r"k8s/rbac\.yaml"):
+    with pytest.raises(RuntimeError, match=r"example_k8s/rbac\.yaml"):
         await provider(api).create()
 
 
@@ -206,8 +193,7 @@ async def test_create_missing_runtimeclass_names_the_fix():
 
 
 async def test_create_gives_up_early_on_an_unpullable_image():
-    """ImagePullBackOff never clears on its own: the create must not sit out the whole
-    timeout, must say what to do about it, and must not leak the pod it gave up on."""
+    """ImagePullBackOff never clears: fail fast, say why, do not leak the pod."""
     api = FakeApi([("POST", "/pods", (201, {})), ("GET", "/pods/", waiting("ImagePullBackOff"))])
     with pytest.raises(RuntimeError, match="SANDBOX_K8S_IMAGE_PULL_SECRETS"):
         await provider(api, create_timeout=30).create()
@@ -226,7 +212,6 @@ async def test_live_session_ids_lists_unfinished_session_pods():
                        {"metadata": {"name": "something-else"}}]}
     api = FakeApi([("GET", "/pods", (200, items))])
     assert await provider(api).live_session_ids() == {"aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"}
-    _m, _p, params = api.calls[0][0], api.calls[0][1], None
     api = FakeApi([("GET", "/pods", (403, {"message": "forbidden"}))])
     assert await provider(api).live_session_ids() is None
 
@@ -252,8 +237,7 @@ async def test_exec_demuxes_stdout_stderr_and_exit_code():
 
 
 async def test_write_file_streams_stdin_and_half_closes():
-    """Why this provider needs v5: without the stdin close frame `cat > file` never sees EOF,
-    so it never exits and never reports a status."""
+    """Without the v5 stdin close frame `cat > file` never sees EOF."""
     seen: dict = {}
 
     async def handler(ws):
@@ -297,8 +281,7 @@ async def test_run_script_streams_the_code_and_runs_it_in_one_exec():
 
 
 async def test_write_file_rejects_a_cluster_without_v5():
-    """A v4-only apiserver cannot half-close stdin, so a write would hang until the timeout.
-    Saying so beats waiting it out."""
+    """A v4-only apiserver cannot half-close stdin; say so instead of hanging."""
     async def handler(ws):
         await ws.send(bytes([CH_ERROR]) + SUCCESS)
 
@@ -331,8 +314,6 @@ async def test_exec_timeout_reports_the_conventional_code():
 
 async def test_exec_on_a_missing_pod_is_session_not_found():
     """The apiserver refuses the upgrade with a 404 before any stream opens."""
-    from websockets.http11 import Response
-
     def refuse(connection, request):
         return connection.respond(404, "pods \"llmsbx-s1\" not found")
 

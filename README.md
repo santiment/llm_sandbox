@@ -112,6 +112,10 @@ curl -s -XDELETE localhost:8900/sessions/$SID -H "$T"   # no body → no Content
 
 ## Deploy on Kubernetes (production)
 
+> `example_k8s/` is a **worked example** of a deployment, not this repo's deployment. Adapt
+> it to your cluster (registry, RuntimeClass, node group, sizing). Santiment's own manifests
+> live in the devops repo and are managed by ArgoCD from there — edit those, not these.
+
 On k8s the service runs as a normal Deployment (trusted, ordinary nodes) and
 `SANDBOX_PROVIDER=k8s` makes every session **one pod under the `gvisor` RuntimeClass**,
 pinned to a dedicated sandbox instance group. The cluster contract is three values —
@@ -134,31 +138,32 @@ docker build --platform linux/amd64 -f sandbox.Dockerfile \
              -t <registry>/llm-sandbox-runtime:v0.1.0 .                                    # runtime
 docker push <registry>/llm-sandbox:v0.1.0 && docker push <registry>/llm-sandbox-runtime:v0.1.0
 
-# 2. Point the manifests at your images (the two CHANGEME lines in k8s/deployment.yaml)
+# 2. Point the manifests at your images (the two CHANGEME lines in example_k8s/deployment.yaml)
 
 # 3. Namespace and the token FIRST — the Deployment mounts that Secret and will not start
 #    without it.
-kubectl apply -f k8s/namespace.yaml
+kubectl apply -f example_k8s/namespace.yaml
 kubectl -n llm-sandbox create secret generic llm-sandbox \
         --from-literal=token=$(openssl rand -hex 32)
 
-# 4. The rest. (`k8s/examples/` is deliberately outside this list — it holds a placeholder
-#    Secret for reference, and applying it would overwrite the real token above.)
-kubectl apply -f k8s/rbac.yaml   -f k8s/networkpolicy.yaml -f k8s/quota.yaml \
-              -f k8s/pdb.yaml    -f k8s/service.yaml       -f k8s/deployment.yaml
+# 4. The rest. (`secret.yaml.example` is deliberately not a .yaml — it is a placeholder for
+#    reference, and applying it would overwrite the real token above.)
+kubectl apply -f example_k8s/rbac.yaml   -f example_k8s/networkpolicy.yaml -f example_k8s/quota.yaml \
+              -f example_k8s/pdb.yaml    -f example_k8s/service.yaml       -f example_k8s/deployment.yaml
 
-# 5. Recommended: kubectl apply -f k8s/admission-session-pods.yaml
+# 5. Recommended: kubectl apply -f example_k8s/admission-session-pods.yaml
 #    A ValidatingAdmissionPolicy that makes the apiserver itself refuse any pod the service's
-#    ServiceAccount creates without runtimeClassName: gvisor / no SA token / disk+memory
-#    limits — the guarantee that holds even if the service is compromised.
-# 6. Optional: kubectl apply -f k8s/hpa.yaml                        # CPU autoscale 2→6
-#              kubectl apply -f k8s/networkpolicy-client-ingress.yaml
+#    ServiceAccount creates unless it runs under runtimeClassName: gvisor, mounts no
+#    ServiceAccount token, and carries memory and disk limits — a guarantee that holds even
+#    if the service itself is compromised.
+# 6. Optional: kubectl apply -f example_k8s/hpa.yaml                        # CPU autoscale 2→6
+#              kubectl apply -f example_k8s/networkpolicy-client-ingress.yaml
 #    The latter restricts who may CALL the service to namespaces labelled
 #    llm-sandbox/client=true — it will cut off unlabelled callers, so label them first.
 ```
 
 **Verify on your cluster before trusting the egress policy** (both are called out inline in
-`k8s/networkpolicy.yaml`): that the `except:` list covers your pod/service CIDRs — kops uses
+`example_k8s/networkpolicy.yaml`): that the `except:` list covers your pod/service CIDRs — kops uses
 `nonMasqueradeCIDR: 100.64.0.0/10`, which is *not* RFC1918 and is easy to miss — and that
 CoreDNS actually carries the `k8s-app: kube-dns` label the DNS rule selects.
 
@@ -174,11 +179,11 @@ Operational notes:
   `SANDBOX_MAX_MEMORY_MB`. The service pod holds ~100 Mi steady-state: it speaks HTTP +
   WebSocket to the apiserver in-process and **ships no `kubectl`**, so it forks nothing per
   request. That is what keeps its limit at 512 Mi and its image at ~77 MB.
-- **Egress:** `k8s/networkpolicy.yaml` is the analogue of docker's `--network none`:
+- **Egress:** `example_k8s/networkpolicy.yaml` is the analogue of docker's `--network none`:
   default-deny for all session pods; `network:true` sessions get DNS + public internet only
   (VPC ranges + cloud metadata blocked). **Requires a CNI that enforces NetworkPolicy** —
   verify on the cluster, otherwise it is silently inert.
-- **Quotas:** `k8s/quota.yaml` caps the namespace at 50 pods and bounds per-pod cpu/memory.
+- **Quotas:** `example_k8s/quota.yaml` caps the namespace at 50 pods and bounds per-pod cpu/memory.
   It is sized to match `SANDBOX_MAX_SESSIONS` × replicas (24 × 2 session pods + 2 service
   pods) — **raise both together**, or creates will start failing at the admission layer.
 - **Pids:** unlike docker's `--pids-limit`, per-pod pid caps come from the kubelet
@@ -187,13 +192,13 @@ Operational notes:
   runaway write fills its own budget, not the node. The kubelet enforces it by eviction, so
   expect a session that blows through it to die rather than to get `ENOSPC`.
 - **Session pod posture:** every capability dropped, `allowPrivilegeEscalation: false`,
-  `RuntimeDefault` seccomp, no SA token, no service links — on top of gVisor. Root inside the
+  `RuntimeDefault` seccomp, no ServiceAccount token, no service links — on top of gVisor. Root inside the
   sandbox is deliberate (files land anywhere), but it is a root that can do nothing to the
   node even if gVisor were somehow bypassed.
 - **Probes:** `/healthz` (liveness) is shallow on purpose; `/readyz` (readiness) checks the
   apiserver and the RBAC, so a missing Role drains the pod from the Service instead of
   restart-looping it. A failed preflight is visible in the `/readyz` body.
-- The service's ServiceAccount can only manage pods in its own namespace (`k8s/rbac.yaml`);
+- The service's ServiceAccount can only manage pods in its own namespace (`example_k8s/rbac.yaml`);
   session pods themselves get **no** service-account token.
 
 ## gVisor / runsc
@@ -217,7 +222,9 @@ gVisor (`runsc`) is the security boundary for untrusted LLM-written code.
     iptables -I DOCKER-USER -s "$SUBNET" -d "$cidr" -j DROP     # metadata + private ranges
   done
   echo 'SANDBOX_DOCKER_NETWORK=llmsbx-net' >> .env
-  # and on EC2, independently: IMDSv2 only, hop limit 1 (containers are one hop too far)
+  # and on EC2, independently: require the instance metadata service's v2 (IMDSv2) and set
+  # its hop limit to 1 — a container is one network hop further away, so its requests for
+  # the node's credentials are dropped
   aws ec2 modify-instance-metadata-options --instance-id "$ID" \
       --http-tokens required --http-put-response-hop-limit 1
   ```
@@ -243,7 +250,7 @@ gVisor (`runsc`) is the security boundary for untrusted LLM-written code.
   and `max_bytes` must be positive (a negative one would reach `head -c` as "all but N").
 - Session **count** capped per replica (`SANDBOX_MAX_SESSIONS`, default 24 → 429 when full),
   so a create loop can't pin the node group; on k8s the namespace ResourceQuota
-  (`k8s/quota.yaml`) enforces the same ceiling cluster-side. When a replica hits its cap it
+  (`example_k8s/quota.yaml`) enforces the same ceiling cluster-side. When a replica hits its cap it
   first re-checks its slots against the backend, so a DELETE that landed on a sibling
   replica frees the slot here too instead of only at the session's deadline.
 - Ephemeral: a session is one container/pod, destroyed on `DELETE` or auto-reaped after
@@ -253,7 +260,7 @@ gVisor (`runsc`) is the security boundary for untrusted LLM-written code.
   caller names would be pulled with the service's registry credentials and run on the
   sandbox nodes.
 - On k8s: session pods mount no ServiceAccount token and the service's RBAC is
-  namespace-scoped; `k8s/admission-session-pods.yaml` makes the apiserver refuse a session
+  namespace-scoped; `example_k8s/admission-session-pods.yaml` makes the apiserver refuse a session
   pod without gVisor even if the service itself is compromised.
 - Per-session writable disk is capped (`SANDBOX_DISK_MB`, k8s only).
 
@@ -271,7 +278,7 @@ src/llm_sandbox/
 Dockerfile            SERVICE image (alpine, multi-stage; targets: prod, dev)
 sandbox.Dockerfile    RUNTIME image — what untrusted code executes in (debian slim)
 sandbox-requirements  .in = what the runtime image needs; .txt = pinned + hashed (uv pip compile)
-k8s/                  manifests; k8s/examples/ is reference-only, never `kubectl apply -f k8s/`
+example_k8s/          reference manifests (a worked example, NOT our deployment — see Deploy)
                       admission-session-pods.yaml: cluster-side gVisor guarantee (recommended)
 tests/                pytest; no cluster, daemon, or network required
 run.sh                dev bring-up, isolation doctor/verify, smoke check, cleanup
@@ -280,7 +287,7 @@ run.sh                dev bring-up, isolation doctor/verify, smoke check, cleanu
 ## Configuration
 
 All config is env-driven (`config.py`); `.env.example` is the annotated template. On k8s these
-are set in `k8s/deployment.yaml`, not in a `.env`.
+are set in `example_k8s/deployment.yaml`, not in a `.env`.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -293,7 +300,7 @@ are set in `k8s/deployment.yaml`, not in a `.env`.
 | `SANDBOX_MAX_OUTPUT_BYTES` | `1000000` | Cap on any stdout/stderr/file payload returned |
 | `SANDBOX_MAX_MEMORY_MB` | `4096` | Ceiling on a caller's `memory_mb` (clamped, not rejected) |
 | `SANDBOX_MAX_CPUS` | `2` | Ceiling on a caller's `cpus` (clamped, not rejected) |
-| `SANDBOX_DISK_MB` | `1024` | Writable disk per session (k8s `ephemeral-storage` limit; not enforced under docker) |
+| `SANDBOX_DISK_MB` | `256` | Writable disk per session (k8s `ephemeral-storage` limit; not enforced under docker) |
 | `SANDBOX_MAX_CONCURRENCY` | `32` | In-flight backend ops across all sessions |
 | `SANDBOX_MAX_SESSION_SECONDS` | `3600` | Ceiling on a session's `timeout_seconds` (clamped) |
 | `SANDBOX_MAX_EXEC_SECONDS` | `600` | Ceiling on an exec/run `timeout_seconds` (clamped) |

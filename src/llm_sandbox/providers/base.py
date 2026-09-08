@@ -1,15 +1,6 @@
-"""The provider seam.
-
-Implement this Protocol to back the HTTP API with gVisor or anything else. The HTTP
-layer (``app.py``) composes ``run`` (python) on top of ``write_file`` + ``exec``, so a
-provider only needs these six primitives. A *session* is a persistent workspace: files
-written via ``write_file`` survive across ``exec`` calls until ``destroy``.
-
-``SessionOpsMixin`` implements the four in-session primitives once, on top of a single
-"run this argv inside the session" hook. Both providers supply that hook — the docker one
-by forking ``docker exec``, the Kubernetes one by opening an apiserver exec stream — so
-file and command semantics stay identical across backends by construction.
-"""
+"""The provider seam. ``SandboxProvider`` is what the HTTP layer calls; ``SessionOpsMixin``
+implements every in-session primitive once over a single "run this argv in the session"
+hook, so file and command semantics cannot drift between backends."""
 
 from __future__ import annotations
 
@@ -25,37 +16,33 @@ from typing import Optional, Protocol, runtime_checkable
 from ..models import ExecResult, FileEntry
 
 WORKDIR = "/workspace"
-TIMEOUT_EXIT = 124  # conventional "timed out" exit code (GNU timeout's, too)
-KILLED_EXIT = 137   # 128+SIGKILL: GNU timeout's code when the command ignored TERM
-LIST_MAX_ENTRIES = 2000  # list_files returns at most this many entries (+ truncated flag)
+TIMEOUT_EXIT = 124  # GNU timeout's exit code too; 137 when the command ignored TERM
+LIST_MAX_ENTRIES = 2000
 _READ_CHUNK = 64 * 1024
 
 
+class SandboxError(RuntimeError):
+    """Backend refused or failed; the message names the fix. HTTP layer → 502."""
+
+
 class SessionNotFound(LookupError):
-    """No container/pod for this session id (never created, already destroyed, or reaped).
-    The HTTP layer maps it to 404."""
+    """No container/pod for this session id. HTTP layer → 404."""
 
 
 class PathNotFound(FileNotFoundError):
-    """The path does not exist inside the session. Mapped to 404 by the HTTP layer; a
-    subclass of FileNotFoundError so callers of the provider API keep their idiom."""
+    """No such path inside the session. HTTP layer → 404."""
 
 
 def clamp_resources(memory_mb: int, cpus: float, *, max_memory_mb: int,
                     max_cpus: float) -> tuple[int, float]:
-    """Bound caller-supplied session limits. Without this a caller can ask for 64 CPUs and
-    30 Gi per session and pin the whole sandbox node group — the request fields are part of
-    the public API, so they are attacker-controlled input, not configuration."""
+    """Bound caller-supplied session limits (public API fields, so attacker-controlled)."""
     memory_mb = max(64, min(int(memory_mb), max_memory_mb))
     cpus = max(0.1, min(float(cpus), max_cpus))
     return memory_mb, cpus
 
 
 def cap_output(data: bytes | str, limit: int) -> tuple[str, bool]:
-    """Cap ``data`` to ``limit`` and report whether it was truncated. Used by every provider
-    to enforce ``max_output_bytes`` on stdout/stderr. ``bytes`` (raw process output) are capped
-    by length and decoded utf-8 with replacement; ``str`` (already-decoded SDK output) are
-    capped by character count."""
+    """Cap ``data`` to ``limit``; bytes are decoded utf-8 with replacement."""
     truncated = len(data) > limit
     data = data[:limit]
     if isinstance(data, bytes):
@@ -65,14 +52,8 @@ def cap_output(data: bytes | str, limit: int) -> tuple[str, bool]:
 
 async def run_cli(*argv: str, stdin: bytes | None = None, timeout: float | None = None,
                   max_bytes: int | None = None) -> tuple[int, bytes, bytes]:
-    """Run a CLI command (docker/…). Returns (exit_code, stdout, stderr); on timeout the
-    process is killed and the exit code is ``TIMEOUT_EXIT``.
-
-    stdout/stderr are read incrementally and each kept to ``max_bytes`` — the rest is drained
-    and dropped. ``communicate()`` would buffer everything the child ever printed, so a
-    ``yes`` running for its whole timeout would grow the service's heap by gigabytes before
-    any cap could apply. Pass ``max_output_bytes + 1`` so truncation stays detectable.
-    """
+    """Run a CLI command. Returns (exit_code, stdout, stderr); ``TIMEOUT_EXIT`` on timeout.
+    Each stream is capped at ``max_bytes`` as it arrives, never buffered whole."""
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
@@ -99,7 +80,7 @@ async def run_cli(*argv: str, stdin: bytes | None = None, timeout: float | None 
             proc.stdin.write(stdin)
             await proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
-            pass  # child exited before reading everything; its exit code tells the story
+            pass  # child exited early; its exit code says why
         finally:
             proc.stdin.close()
 
@@ -115,9 +96,7 @@ async def run_cli(*argv: str, stdin: bytes | None = None, timeout: float | None 
     return proc.returncode if proc.returncode is not None else -1, bytes(out), bytes(err)
 
 
-# python3 is in the sandbox image → reliable JSON listing (beats parsing `ls`). Bounded:
-# a directory with a million files must not become a multi-megabyte exec payload. A stat
-# that fails (dangling symlink, vanished file) reports size 0 instead of failing the listing.
+# python3 is in the sandbox image → reliable JSON listing, bounded to n entries.
 _LIST_FILES_SNIPPET = (
     "import os,sys,json,itertools;p=sys.argv[1];n=int(sys.argv[2]);"
     "es=list(itertools.islice(os.scandir(p),n+1))\n"
@@ -130,13 +109,8 @@ _LIST_FILES_SNIPPET = (
 
 
 class SessionOpsMixin:
-    """``exec``/``write_file``/``read_file``/``list_files`` implemented once against a
-    single provider hook::
-
-        _exec_cli(session_id, *cmd, stdin=None, timeout=None) -> (exit_code, stdout, stderr)
-
-    which runs ``cmd`` inside the session's container/pod, feeding it ``stdin`` when that is
-    not None. Requires ``self.max_output_bytes``."""
+    """In-session primitives over ``_exec_cli(session_id, *cmd, stdin, timeout) ->
+    (exit_code, stdout, stderr)``. Requires ``self.max_output_bytes``."""
 
     max_output_bytes: int
 
@@ -148,37 +122,27 @@ class SessionOpsMixin:
         full = f"cd {shlex.quote(workdir or WORKDIR)} && {command}"
         seconds = max(1, int(timeout_seconds))
         start = time.monotonic()
-        # The deadline is enforced INSIDE the session by GNU `timeout`, which signals the whole
-        # process group (TERM, then KILL a second later). Dropping the exec stream from our
-        # side does not kill anything: a `docker exec` client that goes away leaves the
-        # process running, and so does a kubelet exec without a TTY — the command would keep
-        # burning its CPU share until the session itself is reaped. Exit 124 = timed out,
-        # 137 = timed out and ignored TERM. Our own wait is only the backstop behind it.
+        # Deadline enforced in-session by GNU timeout (dropping the exec stream kills nothing).
+        # 124 = timed out, 137 = timed out and ignored TERM. Our own wait is the backstop.
         rc, out, err = await self._exec_cli(session_id, "timeout", "-k", "1", str(seconds),
                                             "sh", "-c", full, timeout=seconds + 2)
         return self._result(rc, out, err, start)
 
     async def run_script(self, session_id, code, *, interpreter, ext,
                          timeout_seconds=60) -> ExecResult:
-        """Write ``code`` to a scratch file and run it — in ONE round-trip. A write followed
-        by an exec costs two forks (docker) or two TLS+WebSocket handshakes (k8s) per call;
-        here the script arrives on stdin and the same shell that saves it runs it.
-
-        Per-call path, OUTSIDE /workspace: a constant name raced (two concurrent runs on one
-        session overwrote each other between write and exec), and /tmp keeps scratch files
-        out of the listing the model reads back. The file is removed afterwards whatever the
-        exit code; cwd is still /workspace, so the script's relative paths resolve as before.
-        """
+        """One exec: the script arrives on stdin, is saved to a per-call /tmp file, run, removed."""
         seconds = max(1, int(timeout_seconds))
+        data = code.encode("utf-8")
         path = shlex.quote(f"/tmp/_run_{uuid.uuid4().hex}.{ext}")
-        script = (f"cat > {path} && cd {shlex.quote(WORKDIR)} && "
+        # Size check first: a cut stream still gives `cat` a clean EOF.
+        script = (f"cat > {path} && [ \"$(wc -c < {path})\" -eq {len(data)} ] && "
+                  f"cd {shlex.quote(WORKDIR)} && "
                   f"timeout -k 1 {seconds} {shlex.quote(interpreter)} {path}; "
                   f"rc=$?; rm -f {path}; exit $rc")
         start = time.monotonic()
-        # +5 not +2: the deadline only starts once `cat` has the whole script, and the
-        # backstop must not fire while a large payload is still streaming in.
-        rc, out, err = await self._exec_cli(session_id, "sh", "-c", script,
-                                            stdin=code.encode("utf-8"), timeout=seconds + 5)
+        # +5: the backstop must not fire while the payload is still streaming in.
+        rc, out, err = await self._exec_cli(session_id, "sh", "-c", script, stdin=data,
+                                            timeout=seconds + 5)
         return self._result(rc, out, err, start)
 
     def _result(self, rc: int, out: bytes, err: bytes, start: float) -> ExecResult:
@@ -189,22 +153,25 @@ class SessionOpsMixin:
                           truncated=t1 or t2, duration_ms=dur_ms)
 
     async def write_file(self, session_id, path, content, *, encoding="utf-8") -> None:
-        # posixpath, not rsplit: for "/foo" the latter gave "" and `mkdir -p ''` failed the
-        # whole write. dirname("/foo") is "/", dirname("data.csv") is "" → cwd (/workspace).
         parent = posixpath.dirname(path) or WORKDIR
-        # One round-trip: ensure the parent dir, then stream stdin into the file. `mkdir` does
-        # not touch stdin, so the redirect below still consumes the piped content.
-        sink = "base64 -d" if encoding == "base64" else "cat"
-        cmd = f"mkdir -p {shlex.quote(parent)} && {sink} > {shlex.quote(path)}"
-        rc, _out, err = await self._exec_cli(session_id, "sh", "-c", cmd,
-                                             stdin=content.encode("utf-8"), timeout=60)
+        data = content.encode("utf-8")
+        dest = shlex.quote(path)
+        tmp = shlex.quote(f"{path}.partial-{uuid.uuid4().hex[:8]}")
+        # Temp file + size check + atomic mv: a cut stream still gives `cat` a clean EOF.
+        if encoding == "base64":
+            finish = f"base64 -d {tmp} > {dest} || {{ rm -f {dest}; false; }}"
+        else:
+            finish = f"mv -f {tmp} {dest}"
+        cmd = (f"mkdir -p {shlex.quote(parent)} && cat > {tmp} && "
+               f"[ \"$(wc -c < {tmp})\" -eq {len(data)} ] && {finish}; "
+               f"rc=$?; rm -f {tmp}; exit $rc")
+        rc, _out, err = await self._exec_cli(session_id, "sh", "-c", cmd, stdin=data, timeout=60)
         if rc != 0:
-            raise RuntimeError(f"write_file failed: {err.decode(errors='replace').strip()}")
+            raise SandboxError(f"write_file failed: {err.decode(errors='replace').strip()}")
 
     async def read_file(self, session_id, path, *, max_bytes) -> tuple[str, str, bool]:
         limit = min(max_bytes, self.max_output_bytes)
-        # Fetch limit+1 bytes so truncation is detectable without shipping the whole file
-        # across the exec stream.
+        # limit+1 so truncation is detectable.
         rc, out, err = await self._exec_cli(
             session_id, "sh", "-c", f"head -c {limit + 1} {shlex.quote(path)}", timeout=30)
         if rc != 0:
@@ -231,8 +198,7 @@ class SandboxProvider(Protocol):
     name: str
 
     async def startup(self) -> None:
-        """Called once from the app lifespan, inside the event loop. Open pools, start
-        background tasks."""
+        """Called once from the app lifespan, inside the event loop."""
         ...
 
     async def shutdown(self) -> None:
@@ -240,9 +206,7 @@ class SandboxProvider(Protocol):
         ...
 
     async def preflight(self) -> None:
-        """Raise if the backend is not usable (unreachable, missing rights). Backs
-        ``/readyz`` so misconfiguration shows up as an unready pod instead of as the first
-        caller's 500."""
+        """Raise if the backend is unusable; backs /readyz."""
         ...
 
     async def create(self, *, image: Optional[str], timeout_seconds: int, network: bool,
@@ -251,12 +215,12 @@ class SandboxProvider(Protocol):
         ...
 
     async def destroy(self, session_id: str) -> None:
-        """Tear the session down (ephemeral — never reuse across users/tasks)."""
+        """Tear the session down."""
         ...
 
     async def exec(self, session_id: str, command: str, *, timeout_seconds: int,
                    workdir: Optional[str] = None) -> ExecResult:
-        """Run a shell command line (awk/sed/bash/...) in the session."""
+        """Run a shell command line in the session."""
         ...
 
     async def run_script(self, session_id: str, code: str, *, interpreter: str, ext: str,
@@ -265,9 +229,7 @@ class SandboxProvider(Protocol):
         ...
 
     async def live_session_ids(self) -> set[str] | None:
-        """Ids of the sessions that currently exist on the backend, or ``None`` if that
-        cannot be determined right now. Lets the HTTP layer drop slots for sessions that
-        were destroyed via another replica (see ``SessionSlots``)."""
+        """Session ids that exist on the backend, or ``None`` if unknown right now."""
         ...
 
     async def write_file(self, session_id: str, path: str, content: str, *,
